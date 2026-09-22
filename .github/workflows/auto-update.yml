@@ -84,7 +84,25 @@ jobs:
           git config user.name "yunchui"
           git config user.email "yunchui@users.noreply.github.com"
           git fetch upstream dev
-          git merge --no-edit --allow-unrelated-histories upstream/dev
+          # 上游为准的合并：先尝试正常 merge；若有冲突则整体以上游树覆盖，
+          # 最后再由 ensure-fnpak-distributor.py 补回本 fork 的唯一修改。
+          # 不用 --allow-unrelated-histories：会破坏共同祖先导致后续 add/add 冲突。
+          if git merge --no-edit -X theirs upstream/dev 2>/dev/null; then
+            echo "merge ok (-X theirs)"
+          else
+            echo "merge 冲突，改用上游树整体覆盖（保留本 fork 的 workflows/scripts）"
+            git merge --abort 2>/dev/null || true
+            # 备份本 fork 独有的自动化文件
+            cp -r .github /tmp/fork_github 2>/dev/null || true
+            cp -r scripts /tmp/fork_scripts 2>/dev/null || true
+            # 以上游 dev 树覆盖工作区与索引
+            git read-tree --reset -u upstream/dev 2>/dev/null || git rm -rf . && git read-tree --reset -u upstream/dev
+            # 放回本 fork 独有的自动化文件
+            mkdir -p .github scripts
+            cp -r /tmp/fork_github/. .github/ 2>/dev/null || true
+            cp -r /tmp/fork_scripts/. scripts/ 2>/dev/null || true
+            git add -A
+          fi
           # bump VERSION 到上游值
           UP_VERSION="${{ steps.detect.outputs.upstream_dev_version }}"
           echo "${UP_VERSION}" > VERSION
