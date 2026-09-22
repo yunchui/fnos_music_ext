@@ -85,20 +85,29 @@ def test_build_music_info_platform_keys():
         "id": "lx:kg:KGHASH", "_identifier": "KGHASH", "title": "晴天", "artist": "周杰伦",
         "album": "叶惠美", "duration_s": 269, "cover_url": "https://img/1.jpg", "hash": "KGHASH",
     }
+    item["album_id"] = "966846"
     info = sr.build_music_info(item, "kg")
     assert info["hash"] == "KGHASH"
     assert info["songmid"] == "KGHASH"  # 部分脚本读 songmid
-    assert info["interval"] == "04:29"
+    assert info["id"] == "KGHASH"
+    assert info["albumId"] == "966846"  # 六音酷狗 musicUrl 解构 albumId
+    assert info["interval"] == "269"  # 官方 musicInfo.interval 是纯秒数字符串
     assert info["meta"]["picUrl"] == "https://img/1.jpg"
 
     kw = sr.build_music_info({"_identifier": "228908", "rid": "228908", "title": "t"}, "kw")
     assert kw["rid"] == "228908"
     wy = sr.build_music_info({"_identifier": "186016", "song_id": "186016"}, "wy")
     assert wy["songId"] == "186016"
-    tx = sr.build_music_info({"_identifier": "MID", "songmid": "MID"}, "tx")
+    tx = sr.build_music_info(
+        {"_identifier": "MID", "songmid": "MID", "str_media_mid": "MEDIA", "album_id": "8220"},
+        "tx",
+    )
     assert tx["songmid"] == "MID"
+    assert tx["strMediaMid"] == "MEDIA"  # 与 songmid 不是同一个字段
+    assert tx["albumId"] == "8220"
+    assert "strMediaMid" not in sr.build_music_info({"_identifier": "MID", "songmid": "MID"}, "tx")
     assert sr.build_music_info({"_identifier": "1"}, "wy")["meta"]["picUrl"] is None
-    assert sr.build_music_info({"_identifier": "1", "duration_s": 61.6}, "kg")["interval"] == "01:01"
+    assert sr.build_music_info({"_identifier": "1", "duration_s": 61.6}, "kg")["interval"] == "61"
 
 
 # ------------------------------------------------------------------ 下载防护 ---
@@ -653,11 +662,39 @@ def test_bridge_console_exposes_full_standard_api():
 
 def test_bridge_request_body_aligns_with_desktop_json_parsing():
     """桌面版 lx.request 对可 JSON 解析的响应体自动转对象（官方 preload.js 行为），
-    野生脚本普遍直接读 body.code 等字段；桥必须保持一致，否则脚本 undefined 崩溃。"""
+    野生脚本普遍直接读 body.code 等字段；桥必须保持一致，否则脚本 undefined 崩溃。
+    行为级验证见 js/test_bridge.js（需 node）；本断言在无 node 环境仍然生效。"""
     bridge = Path(sr.__file__).with_name("js") / "bridge.js"
     text = bridge.read_text(encoding="utf-8")
-    assert re.search(r"body\s*=\s*JSON\.parse\(text\)", text), \
+    assert re.search(r"=\s*JSON\.parse\(text\)", text), \
         "bridge.js 响应体必须尝试 JSON.parse（失败保持字符串）"
+    # httpFetch 内只允许一处 let body（外层请求体）：循环内再声明同名变量会触发
+    # let TDZ，带 body/form 的 POST 在发送前即 ReferenceError（2.1.1 修复的回归）
+    start = text.index("async function httpFetch")
+    end = text.index("\n}", start)
+    block = text[start:end]
+    assert len(re.findall(r"\blet body\b", block)) == 1, \
+        "httpFetch 内出现第二处 let body（TDZ 会打断带请求体的请求）"
+
+
+def test_bridge_sandbox_aligns_with_desktop_contract():
+    """沙箱契约关键点静态断言（行为级验证见 js/test_bridge.js，需 node）：
+    - rsaEncrypt 必须 NO_PADDING + 左零填充（官方 preload 精确复刻，网易 weapi 依赖）
+    - 沙箱必须提供桌面渲染上下文里脚本惯用的 Web API（缺任一个即 ReferenceError）
+    - lx.request 默认超时/重定向上限对齐桌面版（60s / 10 跳）
+    """
+    bridge = Path(sr.__file__).with_name("js") / "bridge.js"
+    text = bridge.read_text(encoding="utf-8")
+    assert "RSA_NO_PADDING" in text, "rsaEncrypt 必须使用官方 NO_PADDING 语义"
+    assert "Buffer.alloc(128 - " in text, "rsaEncrypt 必须左零填充到 128 字节"
+    sandbox_start = text.index("const sandbox = {")
+    sandbox_end = text.index("};", sandbox_start)
+    sandbox_block = text[sandbox_start:sandbox_end]
+    for api in ("setInterval", "atob", "btoa", "TextEncoder", "TextDecoder",
+                "fetch", "performance", "webcrypto"):
+        assert re.search(rf"\b{api}\b", sandbox_block), f"沙箱缺少桌面版可用的 {api}"
+    assert "Math.min(Number(options.timeout), 60000)" in text, \
+        "lx.request 超时必须对齐桌面版 60s 上限"
 
 
 # ------------------------------------------------------------------ Node 集成 ---

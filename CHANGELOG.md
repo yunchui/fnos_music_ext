@@ -3,6 +3,185 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [Unreleased]
+
+### 修复
+
+- **管理页在手机上的保存条与输入框**：保存条按底部导航的实际高度上移（含安全区），不再压住导航；表单输入拉满卡片宽度，长错误文案换行，手机聚焦输入框不再把页面放大。
+- **洛雪源 QQ/酷狗歌曲信息缺字段**：搜索结果补上 QQ 的 `strMediaMid`（与 songmid 不是同一个值）和酷狗/QQ 的 `albumId`，再交给自定义源脚本。六音等源的酷狗解析和依赖媒体 mid 的 QQ 解析此前拿不到这些字段。
+- **应用中心卸载备份路径**：存储卷路径解析失败时归档落到 `/vol1/`，避免拼成缺少斜杠的根目录文件名导致卸载备份失败。
+
+- **WebUI 网易扫码登录"扫码后没有反应"（重要）**：musicbox CLI 的
+  `auth login/check` 返回 `{ok, data:{code}}` 信封结构（与
+  `netease_login.sh`、musicbox 服务契约一致），而 `static/app.js` 的
+  `pollQr` 读的是顶层 `st.code`——恒为 `undefined`，801/802/803/800
+  全部分支失配，界面永远停在"等待扫码…"。现改为 `st?.data?.code ?? st?.code`
+  （信封优先、扁平兼容），并把轮询主体拆成 `checkQrStatus` 便于测试。
+  同时补齐登录成功后的状态同步：803 后经 `/api/netease/auth/status`
+  （带重试）取昵称写入 `#qr-check`（此前该元素从未被写入），生成二维码
+  前也先同步一次当前账号态。新增 `test_app_js.js/.py`（node 原生
+  assert + 最小 DOM/fetch 桩）锁信封解析行为，`test_webui.py` 反代
+  mock 由失真的扁平结构改为真实信封并补上游异常用例。
+
+## [2.2.3] - 2026-09-21
+
+### 修复
+
+- **应用中心安装失败弹窗误报 Dockerfile `fix_dns`（重要）**：BuildKit 把整段
+  apt `RUN` 打成步骤标题，而脚本里有 `echo "[ERROR] ..."`，弹窗的
+  `grep '[ERROR]'` 命中标题后 300 字截断，只剩 `fix_dns` / `getent hosts`，
+  把后面真正的 installer `[ERROR]` 吞掉。现过滤 `#N [ n/m] RUN` 标题，
+  Dockerfile 失败文案改为不带方括号的 `ERROR:`；`compose up --build` 失败
+  时 install.sh 补一条短 `log_err`。
+- **fpk 安装失败回滚留下孤儿容器**：应用中心删掉 target/repo 但不删
+  `fnmusic-sources`，空挂载容器继续占名、healthcheck 报「未配置任何音源」。
+  `install_callback` 失败时先 `docker rm -f`。
+- **构建层 DNS 自愈不再依赖 getent**：始终把 223.5.5.5 / 119.29.29.29 写到
+  resolv 最前（写入失败不中断），`find` 取 apt 索引加 `|| true` 避免
+  `set -e` 打死；compose 构建使用 `network: host` 以便复用宿主 DNS。
+- **fpk 升级备份在调用方目录展开 `.env.bak*` 会失败**：`fnmusic_data_items`
+  改为在仓库目录内展开通配并返回真实相对路径，`tar -C repo` 不再吃到
+  调用方 cwd 里的同名文件。
+
+## [2.2.2] - 2026-09-21
+
+### 修复
+
+- **洛雪服务端中转源解析全挂——`lx.request` 缺 Promise 形式（重要）**：官方
+  `lx.request` 不传 callback 时返回 Promise（resolve 整个响应对象），主流
+  服务端中转源（如"独家音源"）全部用 `await lx.request(...)` 拿响应；沙箱桥
+  只实现了回调形式并返回取消函数，这类源拿不到响应、只能抛自家通用错误
+  （如 `unknow error`），导致安装向导的洛雪源全链路校验必失败、安装中止
+  （应用中心弹窗只显示"详见日志"且日志随回滚被删）。现补齐双契约：无
+  callback 时返回 Promise，有 callback 时保持 `(err, resp, body)` 回调与
+  取消函数返回值。
+- **应用中心安装/升级失败弹窗看不到真实原因**：install_callback /
+  upgrade_callback 失败时把日志末尾的 `[ERROR]` 行（剥离 ANSI 色码）带进
+  弹窗文案——此前安装失败回滚会删除 TRIM_PKGVAR 里的日志，用户无从排查。
+
+### 新增
+
+- **`--lx-skip-verify` 跳过洛雪源可用性校验**：安装时直接激活洛雪源、不做
+  全链路校验（源状态装好后在管理页 WebUI 查看/重配）。fpk 安装向导新增
+  "跳过洛雪源可用性校验"开关；升级流程固定跳过校验——源是装机时已确认的，
+  源服务器临时故障不应卡死应用升级。校验失败时的错误信息现在包含分类与
+  报告原文，并给出可操作指引。
+
+## [2.2.1] - 2026-09-21
+
+### 新增
+
+- **Gitee 镜像发版**：Release 流水线在 GitHub 发版后，自动将同一份 fpk 与
+  校验文件发布到 Gitee 镜像仓库的发行版（依赖仓库密钥 `GITEE_TOKEN`，
+  未配置时自动跳过）。
+
+### 修复
+
+- **洛雪自定义源大部分不可用——沙箱桥与官方客户端契约不兼容（重要）**：逐项
+  对照洛雪桌面版官方注入实现（`lx-music-desktop` 的 `preload.js`）修复四处实质
+  差异，这些差异会让"在洛雪客户端里可用"的源在本服务里解析失败：
+  - `lx.utils.crypto.rsaEncrypt` 误用 PKCS1 填充，官方是 **NO_PADDING + 左侧零
+    填充到 128 字节**——依赖该语义加密参数的源（如网易 weapi 系）签名必错，
+    相关平台解析全部失败；
+  - 沙箱全局过窄：官方脚本跑在完整桌面渲染上下文，`setInterval`、`atob/btoa`、
+    `TextEncoder/TextDecoder`、`fetch`、`performance`、`crypto.getRandomValues`
+    均可用，沙箱缺任何一个都是 `ReferenceError` 直接打断解析；
+  - `lx.request` 的 object 请求体未序列化（官方底层 needle 按 Content-Type 做
+    JSON 或 urlencoded 编码，沙箱原样交给 fetch 会直接抛错）；
+  - `lx.request` 默认超时 20s → 官方 60s、重定向 3 跳 → 官方 10 跳；响应补
+    `statusMessage`/`bytes`；`bufToString` 对齐 binary 语义。
+  另对齐官方"初始化前任何未捕获异常视为初始化失败"的语义（此前异步崩溃的
+  脚本会假 inited，之后每次解析失败）。
+- **慢源被解析超时掐死**：`LX_RESOLVER_TIMEOUT` 默认 4s → 12s（洛雪源多为二级
+  转发，实证耗时 3-8s，4s 全部超时并连锁触发熔断，观感即"整源不可用"）；
+  播放端 `LX_URL_TIMEOUT` 10s → 20s，代理层每档等待同步放宽到 22s 让降档
+  缓存收敛；`musicInfo.interval` 从 `MM:SS` 改为官方的纯秒数字符串。
+
+## [2.2.0] - 2026-09-21
+
+### 新增
+
+- **推荐歌单封面图标**：「每日推荐」与「热门推荐」歌单在左侧歌单列表显示
+  封面图——取歌单列表里第一首带可用封面直链的曲目（第一首没封面就依次
+  向后找），歌单 `coverId` 以官方 `track_+32hex` 形态下发（官方 App 按
+  id 格式过滤，`online:` 原样下发的 coverId 不会被渲染成图标，这正是此
+  前"只有文字没有图标"的原因）；服务重启后伪装 id 反解注册表会从推荐
+  缓存重建，当天图标不失效。
+- **「热门推荐」独立歌单**：`FNMUSIC_RECOMMEND_HOT` 现在注入一个独立的
+  「热门推荐」歌单（网易热歌榜 → lxmusic 榜单，榜单原味、不排除已收藏），
+  不再只是每日推荐歌单的补位梯队；只开热门、关每日时也会显示；榜单全部
+  不可用时不挂空壳歌单。
+
+### 变更
+
+- **每日推荐歌单不再借用榜单补位**：网易未登录时由 LLM/关键词兜底生成，
+  榜单内容整体移入「热门推荐」歌单；推荐缓存文件按歌单类型拆分为
+  `daily-*.json` / `hot-*.json`，旧格式缓存换日清理后自动重建。
+- **推荐歌单全无封面时封面接口返回 404**：客户端显示自带默认样式，不再
+  伪造占位图（曲目封面的占位图兜底不变，仍永不 404）。
+
+### 修复
+
+- **构建容器 DNS 失败导致安装中断（重要）**：宿主机 DNS 指向本机（127.x/dnsmasq 等）
+  时 Docker 构建容器无法复用宿主 DNS（回退 8.8.8.8，国内不可达），apt 报
+  "Temporary failure resolving"；而旧版回退逻辑以 `apt-get update` 退出码判定失败，
+  DNS 失败只算 W: 警告、退出码为 0，回退永不触发，最终误报 "Unable to locate
+  package"。现在构建层解析探测失败即注入备用公共 DNS（223.5.5.5/119.29.29.29，
+  仅构建层内生效），回退判定改为校验 apt 索引是否真正落地，镜像源与官方源均
+  不可达时报出带排查建议的明确错误；容器内 pip 安装同样自愈并可回退官方 PyPI；
+  安装预检同步新增宿主 DNS 形态提醒。
+- **宿主机代理依赖单源安装易断**：新增 `ensure_proxy_deps.sh`（install.sh /
+  extend.sh 共用），pip 源按 自定义 `PIP_INDEX` → 阿里云镜像 → 官方 PyPI 依次
+  回退并自带重试，全源失败时输出换源与代理排查指引；此前单一清华源不可达即裸报
+  "Could not find a version ... (from versions: none)" 中断安装。
+- **umask 077 检出下容器无法启动**：`supervisord.conf` 经 COPY 保留检出权限，
+  以 600（root:root）进镜像，容器内 appuser 读不了配置，supervisord 起不来、
+  安装健康检查超时；现镜像内显式 `chmod 0644`，权限不再依赖构建上下文。以上
+  修复同时覆盖 git 安装与 fpk 应用中心安装两条链路（fpk 随下次打包生效）。
+
+## [2.1.1] - 2026-09-21
+
+补齐 bash 编排层与沙箱桥的测试空洞（近期安装/搜索类回归多落在这些无执行测试的
+环节），过程中发现并修复三处真实缺陷。
+
+### 修复
+
+- **洛雪自定义源的 `lx.request` 带请求体请求全部失败（重要）**：v2.1.0 给桥
+  （bridge.js）加"响应体 JSON 自动转对象"时，解析变量与外层请求体变量同名，
+  `let` 提升导致发送前就抛 "Cannot access 'body' before initialization"——
+  所有 POST（body/form/formData）请求失败，GET 不受影响所以难以察觉。
+- **fpk 升级/卸载备份可能漏掉 `.env` 历史备份**：`packaging/fpk/cmd/_common`
+  的数据项通配未加引号，`for` 列表在调用者目录提前展开，恰有 `.env.bak*`
+  文件时仓库内的同名文件会被漏备份。
+- **WebUI 预览音源到期停止失败后进程漏停**：`preview_reap` 在 supervisorctl
+  停止失败时也移除预览表项，偶发失败（如容器重启窗口）后无人重试、进程常驻；
+  现在失败保留表项，下一轮清退循环重试。
+
+### 新增
+
+- **fpk 生命周期钩子行为测试（32 项）**：`packaging/tests/test_fpk_cmds.py`
+  用桩命令在沙箱里执行真实的 install/upgrade/uninstall 钩子脚本，覆盖备份
+  内容、恢复链、向导映射、失败中止等分支。
+- **安装脚本深水区测试（30 项）**：`proxy/tests/test_install_edges.py` 覆盖
+  基础镜像候选与缓存、extend 验收/回滚、洛雪源校验激活、网易扫码登录的
+  关键分支。
+- **内置搜索器回放契约测试**：`lxmusic-service/test_searchers_replay.py` 用
+  真实录制的酷狗/网易/酷我/QQ 响应 fixture 回放断言解析输出；配套手动录制
+  工具 `tests/integration/capture_search_fixtures.py` 便于接口改版后刷新。
+- **洛雪源沙箱桥 Node 行为测试（13 项）**：`lxmusic-service/js/test_bridge.js`
+  起 http 服务器真实驱动 bridge.js，锁死 console 全 API、重定向/303/超时、
+  musicUrl 协议往返等行为；`test_bridge_node.py` 包装进 pytest（无 node
+  自动跳过，CI 显式安装 node 保证执行）。
+- **实机升级链测试**：`tests/integration/fpk_lifecycle.py` 新增直调
+  `upgrade_init`/`upgrade_callback` 阶段（appcenter-cli 不支持升级），
+  覆盖"备份→模拟覆盖→恢复重装"全链。
+- **熔断半开并发用例**：半开窗口内连续请求只放行一个试探、失败试探顺延窗口。
+- CI：test job 显式安装 node（避免桥测试静默跳过）、输出测试覆盖率摘要。
+
+### 变更
+
+- 版本号 `2.1.0` → `2.1.1`。
+
 ## [2.1.0] - 2026-09-21
 
 v2.1.0 新增 **fnOS 应用中心 fpk 打包与发布**：本扩展可以作为飞牛第三方应用

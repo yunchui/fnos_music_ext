@@ -115,12 +115,13 @@ def build_music_info(item: dict, platform: str) -> dict:
     tx 用 strMediaMid，mg 用 copyrightId，一并冗余提供。"""
     identifier = str(item.get("_identifier") or "")
 
-    def minutes_seconds(seconds: Any) -> str:
+    def seconds_str(seconds: Any) -> str:
+        # 洛雪官方 musicInfo.interval 是纯秒数字符串（如 "253"），不是 MM:SS
         try:
             total = int(float(seconds) or 0)
         except (TypeError, ValueError):
             total = 0
-        return f"{total // 60:02d}:{total % 60:02d}"
+        return str(total)
 
     info = {
         "songmid": identifier,
@@ -128,7 +129,7 @@ def build_music_info(item: dict, platform: str) -> dict:
         "name": str(item.get("title") or ""),
         "singer": str(item.get("artist") or ""),
         "source": platform,
-        "interval": minutes_seconds(item.get("duration_s")),
+        "interval": seconds_str(item.get("duration_s")),
         "albumName": str(item.get("album") or ""),
         "meta": {
             "songId": identifier,
@@ -149,6 +150,15 @@ def build_music_info(item: dict, platform: str) -> dict:
         info[platform_key[0]] = str(platform_key[1])
     if platform == "kg" and item.get("hash"):
         info["songmid"] = str(item["hash"])  # 部分脚本读 songmid
+    # 社区源（六音酷狗、全豆要 QQ）按官方 musicInfo 读这些别名。
+    # QQ 的 songmid 与 file.media_mid 经常不是同一个值，不能互相顶替。
+    info["id"] = info.get("songmid") or identifier
+    album_id = str(item.get("album_id") or "").strip()
+    if album_id and album_id not in ("0", "None"):
+        info["albumId"] = album_id
+    media_mid = str(item.get("str_media_mid") or item.get("media_mid") or "").strip()
+    if media_mid:
+        info["strMediaMid"] = media_mid
     return info
 
 
