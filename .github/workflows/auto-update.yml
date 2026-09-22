@@ -102,8 +102,9 @@ jobs:
           if git diff --cached --quiet; then
             echo "merged but no version change (unexpected)"
           else
-            git -c user.name="yunchui" -c user.email="yunchui@users.noreply.github.com" \
-              commit -m "chore: 同步上游 javycoder dev → ${UP_VERSION}（自动）"
+            git config user.name "yunchui"
+            git config user.email "yunchui@users.noreply.github.com"
+            git commit -m "chore: 同步上游 javycoder dev → ${UP_VERSION}（自动）"
           fi
           echo "version=${UP_VERSION}" >> "$GITHUB_OUTPUT"
 
