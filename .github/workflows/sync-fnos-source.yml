@@ -1,0 +1,160 @@
+name: Sync fnmusic-ext to fnos-source
+
+# 当 fnmusic-ext 发布新的 GitHub Release 后，自动更新
+# yunchui/fnos-source 中 fnmusic-ext 条目的版本/sha256/size/download_url。
+# 需在仓库 Secrets 配置 MY_PAT_TOKEN（对 fnos-source 有写权限）。
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync-source:
+    runs-on: ubuntu-latest
+    if: github.repository == 'yunchui/fnos_music_ext'
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.MY_PAT_TOKEN }}
+          fetch-depth: 1
+
+      - name: Checkout fnos-source
+        uses: actions/checkout@v4
+        with:
+          repository: yunchui/fnos-source
+          token: ${{ secrets.MY_PAT_TOKEN }}
+          path: source
+
+      - name: Read latest release info
+        id: relinfo
+        env:
+          GH_TOKEN: ${{ secrets.MY_PAT_TOKEN }}
+        run: |
+          # 手动触发且无 tag 时，取最新 stable release；否则用触发本次的 tag
+          TAG="${GITHUB_REF_NAME}"
+          if [ -z "$TAG" ] || [ "$TAG" = "main" ] || [ "$TAG" = "master" ]; then
+            python3 - <<'PY'
+            import json, os
+            import urllib.request
+            token = os.environ["GH_TOKEN"]
+            req = urllib.request.Request(
+                "https://api.github.com/repos/yunchui/fnos_music_ext/releases/latest",
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                         "User-Agent": "fnmusic-sync"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                rel = json.load(r)
+            ver = rel["tag_name"].lstrip("v")
+            asset = None
+            for a in rel.get("assets", []):
+                if a["name"].startswith("fnmusic-ext-") and a["name"].endswith(".fpk"):
+                    asset = a; break
+            if not asset:
+                raise SystemExit("ERROR: release 无 fnmusic-ext-*.fpk 资产")
+            digest = asset.get("digest", "").replace("sha256:", "").rstrip()
+            info = {"version": ver, "url": asset["browser_download_url"],
+                    "sha256": digest, "size": asset["size"],
+                    "published": rel.get("published_at") or ""}
+            open("/tmp/fnmusic_release.json", "w").write(json.dumps(info))
+            print("detected:", info)
+            PY
+          else
+            python3 - <<'PY'
+            import json, os
+            import urllib.request
+            token = os.environ["GH_TOKEN"]
+            tag = "${TAG}".lstrip("v")
+            # 精确查该版本 release
+            req = urllib.request.Request(
+                "https://api.github.com/repos/yunchui/fnos_music_ext/releases/tags/v%s" % tag,
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                         "User-Agent": "fnmusic-sync"})
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    rel = json.load(r)
+            except Exception as e:
+                raise SystemExit("ERROR: 查询 release v%s 失败: %s" % (tag, e))
+            asset = None
+            for a in rel.get("assets", []):
+                if a["name"].startswith("fnmusic-ext-") and a["name"].endswith(".fpk"):
+                    asset = a; break
+            if not asset:
+                raise SystemExit("ERROR: release v%s 无 fnmusic-ext-*.fpk 资产" % tag)
+            digest = asset.get("digest", "").replace("sha256:", "").rstrip()
+            info = {"version": tag, "url": asset["browser_download_url"],
+                    "sha256": digest, "size": asset["size"],
+                    "published": rel.get("published_at") or ""}
+            open("/tmp/fnmusic_release.json", "w").write(json.dumps(info))
+            print("detected:", info)
+            PY
+          fi
+          # 导出关键值
+          python3 - <<'PY'
+          import json
+          info = json.load(open("/tmp/fnmusic_release.json"))
+          if not info["sha256"] or len(info["sha256"]) != 64:
+              raise SystemExit("ERROR: sha256 无效或缺失，拒绝写入坏校验值")
+          PY
+
+      - name: Update fnpack.json (fnos-source)
+        run: |
+          python3 - <<'PY'
+          import json
+          info = json.load(open("/tmp/fnmusic_release.json"))
+          ver = info["version"]
+          fnp = "source/fnpack.json"
+          with open(fnp, encoding="utf-8") as f:
+              d = json.load(f)
+          apps = d.get("apps", {})
+          entry = apps.get("fnmusic-ext")
+          if not entry:
+              print("fnos-source 无 fnmusic-ext 条目，跳过")
+              raise SystemExit(0)
+          # updated_at: published（UTC Z）→ +08:00
+          from datetime import datetime, timedelta, timezone
+          published = info["published"].replace("Z", "+00:00") if info["published"] else ""
+          if published:
+              dt = datetime.fromisoformat(published).astimezone(timezone(timedelta(hours=8)))
+              updated = dt.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+          else:
+              updated = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+          new_rel = {
+              "changelog": "跟随上游 javycoder/fnos_music_ext 自动同步。",
+              "updated_at": updated,
+              "os_min_version": entry.get("releases", {}).get(ver, {}).get("os_min_version", "1.2.0"),
+              "packages": {
+                  "all": {
+                      "download_url": info["url"],
+                      "sha256": info["sha256"],
+                      "size": info["size"]
+                  }
+              }
+          }
+          releases = entry.setdefault("releases", {})
+          if ver not in releases or releases.get(ver) != new_rel:
+              releases[ver] = new_rel
+              with open(fnp, "w", encoding="utf-8") as f:
+                  json.dump(d, f, ensure_ascii=False, indent=2)
+              print("fnpack.json 已更新 fnmusic-ext ->", ver)
+          else:
+              print("fnmusic-ext 已是 %s，无变更" % ver)
+          PY
+
+      - name: Commit and push to fnos-source
+        run: |
+          cd source
+          if git diff --quiet; then
+            echo "无变更，跳过提交"
+            exit 0
+          fi
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add fnpack.json
+          git commit -m "🤖 同步 fnmusic-ext 至 $(python3 -c 'import json;print(json.load(open("/tmp/fnmusic_release.json"))["version"])')"
+          git push "https://x-access-token:${MY_PAT_TOKEN}@github.com/yunchui/fnos-source.git" HEAD:main
+        env:
+          MY_PAT_TOKEN: ${{ secrets.MY_PAT_TOKEN }}

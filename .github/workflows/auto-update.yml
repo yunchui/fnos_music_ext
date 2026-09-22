@@ -1,0 +1,139 @@
+name: Auto-update upstream (javycoder)
+
+# 自动同步上游 javycoder/fnos_music_ext 的 dev 分支到本 fork 的 main：
+#   - 检测上游 dev 的 VERSION 是否高于本地 main
+#   - 若更高：合并上游 dev → main，bump VERSION，commit & push
+#   - 打 v<VERSION> tag，触发 release.yml 构建 FPK 并发布
+# 也支持手动触发（workflow_dispatch）。
+#
+# 2026-09-21 建：上游 javycoder 是官方活跃源（dev 分支），本 workflow 跟随其版本。
+
+on:
+  schedule:
+    - cron: '20 2 * * *'   # 每天 UTC 02:20（北京 10:20）
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制同步（忽略版本比较，直接拉上游 dev）'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  sync-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.MY_PAT_TOKEN }}
+          ref: main
+          fetch-depth: 0
+
+      - name: Detect upstream dev version
+        id: detect
+        env:
+          GITHUB_TOKEN: ${{ secrets.MY_PAT_TOKEN }}
+        run: |
+          UP_VERSION="$(curl -fsSL --max-time 30 \
+            "https://raw.githubusercontent.com/javycoder/fnos_music_ext/dev/VERSION" | tr -d '[:space:]')"
+          LOCAL_VERSION="$(head -n1 VERSION | tr -d '[:space:]')"
+          echo "upstream_dev_version=${UP_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "local_version=${LOCAL_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "upstream=$UP_VERSION local=$LOCAL_VERSION"
+          if [ -z "${UP_VERSION}" ]; then
+            echo "::error:: 无法读取上游 dev VERSION"
+            exit 1
+          fi
+          # 版本比较（字符串按 v 分段比较）
+          newer() {
+            python3 - "$1" "$2" << 'PY'
+            import sys
+            def v(s):
+                return [int(x) if x.isdigit() else x for x in s.lstrip('v').split('.') if x]
+            def cmp(a,b):
+                av,bv=v(a),v(b)
+                for i in range(max(len(av),len(bv))):
+                    x=av[i] if i<len(av) else 0
+                    y=bv[i] if i<len(bv) else 0
+                    if isinstance(x,int) and isinstance(y,int):
+                        if x>y: return 1
+                        if x<y: return -1
+                    else:
+                        xa,ya=str(x),str(y)
+                        if xa>ya: return 1
+                        if xa<ya: return -1
+                return 0
+            sys.exit(0 if cmp(sys.argv[1],sys.argv[2])>0 else 1)
+            PY
+          }
+          FORCE="${{ github.event.inputs.force || 'false' }}"
+          if [ "${FORCE}" = "true" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "force sync"
+          elif [ "${UP_VERSION}" != "${LOCAL_VERSION}" ] && newer "${UP_VERSION}" "${LOCAL_VERSION}"; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "new upstream version ${UP_VERSION}"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "no update (local=${LOCAL_VERSION} upstream=${UP_VERSION})"
+          fi
+
+      - name: Merge upstream dev and bump
+        id: merge
+        if: steps.detect.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.MY_PAT_TOKEN }}
+        run: |
+          git remote add upstream "https://x-access-token:${GITHUB_TOKEN}@github.com/javycoder/fnos_music_ext.git"
+          git fetch upstream dev
+          # 合并上游 dev（保留本 fork 的 distributor 修改）
+          git merge --no-edit --allow-unrelated-histories upstream/dev
+          # bump VERSION 到上游值
+          UP_VERSION="${{ steps.detect.outputs.upstream_dev_version }}"
+          echo "${UP_VERSION}" > VERSION
+          head -n1 packaging/fpk/manifest.in > /tmp/manifest_head_check
+          # manifest.in 的 version 是 @VERSION@（build.sh 运行时替换），无需改
+          # 但如果上游 manifest.in 写了私有 distributor，重新确保 yunchui
+          sed -i \
+            -e 's/^distributor[[:space:]]*=.*/distributor           = yunchui/' \
+            -e 's#^distributor_url[[:space:]]*=.*#distributor_url       = https://github.com/yunchui/fnos_music_ext#' \
+            packaging/fpk/manifest.in || true
+          git add VERSION packaging/fpk/manifest.in
+          if git diff --cached --quiet; then
+            echo "merged but no version change (unexpected)"
+          else
+            git -c user.name="yunchui" -c user.email="yunchui@users.noreply.github.com" \
+              commit -m "chore: 同步上游 javycoder dev → ${UP_VERSION}（自动）"
+          fi
+          echo "version=${UP_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Push main
+        if: steps.detect.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.MY_PAT_TOKEN }}
+        run: |
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/yunchui/fnos_music_ext.git" main
+
+      - name: Create tag
+        if: steps.detect.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.MY_PAT_TOKEN }}
+        run: |
+          cd "${GITHUB_WORKSPACE}"
+          git fetch --tags origin
+          TAG="v${{ steps.merge.outputs.version }}"
+          if ! git tag -l "${TAG}" | grep -q .; then
+            git tag "${TAG}"
+            git push "https://x-access-token:${GITHUB_TOKEN}@github.com/yunchui/fnos_music_ext.git" "${TAG}"
+            echo "tagged ${TAG}"
+          else
+            echo "tag ${TAG} already exists, skip"
+          fi
+
+      - name: No update
+        if: steps.detect.outputs.changed == 'false'
+        run: echo "上游无新版本，跳过同步"
