@@ -1074,17 +1074,30 @@ cleanup_legacy_sources() {
     # 旧 v1.x 部署形态清理：宿主机三 unit + 三容器（单容器接管端口 8768/8770/8772）
     local unit
     for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-lxmusic; do
-        stop_owned_source_unit "${unit}"
-        remove_owned_container "${unit}"
+        if [ "${ADOPT:-0}" -eq 1 ]; then
+            stop_owned_source_unit "${unit}" --adopt
+            remove_owned_container "${unit}" --adopt
+        else
+            stop_owned_source_unit "${unit}"
+            remove_owned_container "${unit}"
+        fi
     done
 }
 
 install_sources_container() {
     log_info "构建并启动单容器 ${CONTAINER_NAME}（所选音源 + WebUI 按需启动）..."
     cleanup_legacy_sources
-    reclaim_container "${CONTAINER_NAME}" || return 1
+    if [ "${ADOPT:-0}" -eq 1 ]; then
+        reclaim_container "${CONTAINER_NAME}" --adopt || return 1
+    else
+        reclaim_container "${CONTAINER_NAME}" || return 1
+    fi
+    # issue #24：构建日志逐层可见（非 tty 下默认进度条会被压成静默，看似"卡在 55%"）
+    export BUILDKIT_PROGRESS="${BUILDKIT_PROGRESS:-plain}"
     if ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build; then
         log_err "Docker 镜像构建或启动失败（compose up --build）。"
+        log_err "若日志里反复出现 apt/pip 拉取超时：多为国内网络直连境外源受限，"
+        log_err "可为 Docker 配置代理后重试，或检查 /var/log/apps/fnmusic-ext-install.log 定位具体步骤。"
         return 1
     fi
     # 按所选音源等待 healthz（entrypoint 只拉起所选程序，其余端口无人监听是预期行为）
