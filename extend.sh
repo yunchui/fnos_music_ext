@@ -509,15 +509,8 @@ ensure_image_current() {
     fi
 }
 
-# .env 比容器启动新（安装/切源改了开关）且镜像未变时，compose 不会重建容器：
-# 需显式重启让 entrypoint 重读 .env 重选进程集。
-env_newer_than_container() {
-    local started epoch_start epoch_env
-    started="$(run_docker inspect -f '{{.State.StartedAt}}' "${CONTAINER_NAME}" 2>/dev/null)" || return 1
-    epoch_start="$(date -u -d "${started}" +%s 2>/dev/null)" || return 1
-    epoch_env="$(stat -c %Y "${BASE_DIR}/.env" 2>/dev/null)" || return 1
-    [ "${epoch_env}" -gt "${epoch_start}" ]
-}
+# .env 比容器新时需重启让 entrypoint 重读开关：env_newer_than_container 已移入
+# proxy/install_common.sh（install.sh 的等待点同样依赖，见 install_sources_container）。
 
 if [ "${need_start}" -eq 0 ]; then
     # 全部就绪：确认端口确由本目录的 fnmusic-sources 提供（不借用其他 checkout 的容器）
@@ -559,6 +552,7 @@ wait_source() {
         return 0
     fi
     log_err "等待 ${name} healthz 超时 (${url}/healthz)"
+    diagnose_sources_container "${CONTAINER_NAME}"
     return 1
 }
 
@@ -601,7 +595,7 @@ else:
             ;;
         *)
             log_warn "尚未配置洛雪用户自定义源（播放解析不可用，搜索/榜单不受影响）。"
-            log_warn "可在 WebUI (http://<NAS_IP>:8774) 配置，或重跑 install.sh 时提供 --lx-source-url。"
+            log_warn "可在飞牛管理员打开的管理页配置，或重跑 install.sh 时提供 --lx-source-url。"
             ;;
     esac
 fi
@@ -699,14 +693,14 @@ if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
     log_info "   若遇到部分网易云 VIP/无损歌曲需登录："
     log_info "   • 命令行扫码登录（推荐）: ./extend.sh --qr 或 ./netease_login.sh"
     log_info "     （自动展示二维码、轮询登录状态、过期自动刷新，支持随时 Ctrl+C 跳过）"
-    log_info "   • 浏览器图片扫码（备选）: http://<NAS_IP>:8770/api/v1/auth/login/qr.png"
-    log_info "   • 查询登录状态: curl -s http://127.0.0.1:8770/api/v1/auth/status"
+    log_info "   • 管理页内扫码：飞牛管理员打开「fnMusic 扩展管理」后在「音乐源」扫码"
+    log_info "   • 本机查询登录状态: curl -s http://127.0.0.1:8770/api/v1/auth/status"
 fi
 log_info "3. 健康检查与运维："
 log_info "   • 探测状态: curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz"
 log_info "   • 查看日志: sudo journalctl -u fnmusic-ext -f"
 if [ "${ENABLE_WEBUI}" -eq 1 ]; then
-    log_info "   • 管理 WebUI: http://<NAS_IP>:8774（无鉴权，仅限可信内网；音源三选一/音质/推荐/LLM 运行期可调）"
+    log_info "   • 管理 WebUI: 飞牛桌面「fnMusic 扩展管理」（仅管理员；音源三选一/音质/推荐/LLM 运行期可调）"
 fi
 log_info "   • 一键还原: ./restore.sh (一键无损切回官方原生直连)"
 log_info "============================================================"

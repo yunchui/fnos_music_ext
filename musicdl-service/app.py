@@ -7,9 +7,12 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request
@@ -28,16 +31,49 @@ except ImportError:
     logger.warning("curl_cffi not installed, falling back to standard httpx client")
 
 from musicdl import musicdl  # noqa: E402
-from hardening import AdaptiveTimeout, SearchCache, SourceBreaker, SingleFlight, SourceBulkhead, SourceBusy, SearchProgress
+from hardening import AdaptiveTimeout, SearchCache, SourceBreaker, SingleFlight, SourceBulkhead, SourceBusy, SearchProgress  # noqa: E402
+
+# 复用仓库根（容器内 /srv）的 proxy.env_merge 解析 .env；独立运行无仓库结构时退回纯环境变量
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+try:
+    from proxy.env_merge import parse_env_file  # noqa: E402
+except ImportError:
+    parse_env_file = None
+
+
+def _startup_sources() -> "tuple[list[str], str]":
+    """解析 MUSICDL_SOURCES 白名单：.env > 进程环境变量 > 内置默认。
+
+    WebUI 保存只写 bind mount 的 /repo/.env 再 supervisorctl restart；restart 继承的
+    是容器启动时刻的 supervisord 环境，新白名单只可能出现在 .env 里，所以 .env
+    必须优先于（可能陈旧的）环境变量。
+    """
+    raw = ""
+    origin = ""
+    if parse_env_file is not None:
+        env_path = Path(os.environ.get("FNMUSIC_ENV_FILE", "/repo/.env"))
+        try:
+            kv, _ = parse_env_file(env_path)
+            raw = (dict(kv).get("MUSICDL_SOURCES") or "").strip()
+        except Exception:
+            raw = ""
+        if raw:
+            origin = f"env file {env_path}"
+    if not raw:
+        raw = os.environ.get("MUSICDL_SOURCES", "").strip()
+        if raw:
+            origin = "process env"
+    if not raw:
+        raw = "KuwoMusicClient,MiguMusicClient"
+        origin = "builtin default"
+    sources = [s.strip() for s in raw.split(",") if s.strip()]
+    return sources, origin
+
+
+_CONF_SOURCES, _SOURCES_ORIGIN = _startup_sources()
 
 CONF = {
-    "sources": [
-        s.strip()
-        for s in os.environ.get(
-            "MUSICDL_SOURCES", "KuwoMusicClient,MiguMusicClient"
-        ).split(",")
-        if s.strip()
-    ],
+    "sources": _CONF_SOURCES,
     "search_timeout": float(os.environ.get("MUSICDL_SEARCH_TIMEOUT", "12")),
     "limit_per_source": int(os.environ.get("MUSICDL_LIMIT_PER_SOURCE", "10")),
     "url_ttl": int(os.environ.get("MUSICDL_URL_TTL", "1800")),
@@ -127,6 +163,10 @@ CONF["sources"] = _normalize_startup_sources(CONF["sources"])
 
 SOURCE_NAMES = _source_mapping()
 SOURCE_WORKERS = SourceBulkhead(SOURCE_NAMES.values())
+# 直链探活共享池：探测跑在 worker 线程之外，单个源不会因为串行 HEAD
+# 占住自己的单线程舱壁 N×probe_timeout 秒。生命周期跟随进程（不随
+# lifespan 关闭），解释器退出时由 concurrent.futures 的 atexit 钩子回收。
+_PROBE_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="probe")
 
 
 def _source_client(name: str) -> str:
@@ -286,18 +326,13 @@ def _search_playable(source: str, keyword: str, fetch_size: int, limit: int,
     """Keep search and bounded probes inside the same source admission slot.
 
     Return metadata only; a timed-out worker must not update shared caches.
+    Probes fan out on the shared pool; each confirmed entry is handed to
+    `progress` immediately (same handoff timing as the old serial loop), and
+    the return value keeps library order.
     """
     songs = _search_one_source(source, keyword, fetch_size)
-    entries = []
-    probe_estimate = 0.0
+    candidates = []
     for song in songs[:fetch_size]:
-        # Leave room for the slowest observed probe and event-loop handoff.
-        # An unexpectedly slower probe is covered by the progress snapshot.
-        if ((deadline is not None and time.monotonic() + probe_estimate >= deadline)
-                or (progress is not None and progress.stopped())):
-            if progress is not None:
-                progress.partial = True
-            break
         if not song:
             continue
         item = _normalize(song, keyword)
@@ -306,18 +341,38 @@ def _search_playable(source: str, keyword: str, fetch_size: int, limit: int,
         if not _is_candidate_playable(song, item):
             continue
         headers = getattr(song, "default_download_headers", {}) or {}
-        probe_started = time.monotonic()
-        valid = _probe_playable_sync(item["download_url"], headers)
-        probe_estimate = max(probe_estimate, (time.monotonic() - probe_started) * 1.1)
-        if not valid:
-            continue
-        entry = (item, headers, str(getattr(song, "lyric", "") or ""))
-        entries.append(entry)
+        lyric = str(getattr(song, "lyric", "") or "")
+        candidates.append((item, headers, lyric))
+    if not candidates:
+        return []
+    if (progress is not None and progress.stopped()) or (
+            deadline is not None and time.monotonic() >= deadline):
         if progress is not None:
-            progress.append(entry)
-        if len(entries) >= limit:
-            break
-    return entries
+            progress.partial = True
+        return []
+
+    valid = set()
+    futures = {}
+    for idx, (item, headers, _) in enumerate(candidates):
+        futures[_PROBE_POOL.submit(_probe_playable_sync, item["download_url"], headers)] = idx
+    try:
+        wait_budget = None if deadline is None else max(0.1, deadline - time.monotonic())
+        for fut in as_completed(futures, timeout=wait_budget):
+            idx = futures[fut]
+            if fut.result():
+                valid.add(idx)
+                if progress is not None:
+                    progress.append(candidates[idx])
+                if len(valid) >= limit:
+                    break
+    except FuturesTimeoutError:
+        if progress is not None:
+            progress.partial = True
+    finally:
+        for fut in futures:
+            fut.cancel()
+
+    return [entry for idx, entry in enumerate(candidates) if idx in valid]
 
 
 async def _refresh_by_keyword(song_id: str) -> dict | None:
@@ -422,6 +477,7 @@ async def lifespan(app: FastAPI):
     logger.info("=== musicdl-service configuration ===")
     for k, v in CONF.items():
         logger.info("  %s = %s", k, v)
+    logger.info("  MUSICDL_SOURCES origin = %s", _SOURCES_ORIGIN)
     logger.info("  HAS_CURL_CFFI = %s", HAS_CURL_CFFI)
     logger.info("=====================================")
 
