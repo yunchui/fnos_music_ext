@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -66,6 +68,7 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_ONLINE_SOURCES": {"kind": "csv", "default": "", "group": "musicdl", "reload": "process", "label": "musicdl 启用平台"},
     "MUSICDL_SOURCES": {"kind": "csv", "default": "", "group": "musicdl", "reload": "process", "label": "musicdl 服务白名单（联动）"},
     "LX_SOURCE_URL": {"kind": "str", "default": "", "group": "lx", "reload": "process", "label": "洛雪源脚本地址（http(s) URL 或 file:// 上传地址）"},
+    "LX_SOURCE_LIST": {"kind": "str", "default": "[]", "group": "lx", "reload": "hot", "label": "洛雪源列表（JSON 数组）"},
     "LX_SOURCES": {"kind": "csv", "default": "kg,wy,mg,kw", "group": "lx", "reload": "hot", "label": "lx 平台（按源声明推导）"},
     "FNMUSIC_QUALITY_MODE": {"kind": "enum", "values": ["high", "balanced", "smooth"], "default": "high", "group": "quality", "reload": "hot", "label": "音质偏好"},
     "FNMUSIC_RECOMMEND_HOT": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "热门榜单推荐"},
@@ -84,6 +87,8 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_LLM_MODEL": {"kind": "str", "default": "gpt-4o-mini", "group": "llm", "reload": "hot", "label": "模型"},
     "FNMUSIC_SEARCH_TIMEOUT": {"kind": "int", "default": "15", "min": 1, "max": 60, "group": "search", "reload": "hot", "label": "搜索超时时间"},
     "FNMUSIC_SEARCH_PROBE": {"kind": "bool", "default": "false", "group": "search", "reload": "hot", "label": "逐曲探活(beta)"},
+    "FNMUSIC_SEARCH_DEEP_PAGE": {"kind": "bool", "default": "true", "group": "search", "reload": "hot", "label": "搜索深分页"},
+    "FNMUSIC_SEARCH_DEEP_MAX_PAGES": {"kind": "int", "default": "10", "min": 1, "max": 50, "group": "search", "reload": "hot", "label": "深分页页数上限"},
     "FNMUSIC_NETEASE_MY_PLAYLISTS": {"kind": "bool", "default": "false", "group": "source", "reload": "hot", "label": "网易账号歌单"},
 }
 
@@ -167,17 +172,32 @@ def supervisor_status() -> dict[str, dict]:
     return result
 
 
+PROVIDER_PROGRAMS = {
+    "musicdl": ["musicdl"],
+    "musicbox": ["musicbox"],
+    "lxmusic": ["lxserver", "lxmusic"],
+}
+PROVIDER_PROGRAM = {"musicdl": "musicdl", "musicbox": "musicbox", "lxmusic": "lxmusic"}  # 兼容单名引用
+PROVIDER_HEALTH = {"musicdl": CONF["musicdl_url"], "musicbox": CONF["musicbox_url"], "lxmusic": CONF["lx_url"]}
+
+
 def switch_provider_process(old: str, new: str) -> list[dict]:
     """切源进程：先停旧再起新；失败逐项记录，不抛出。"""
     actions: list[dict] = []
     if old and old != new:
-        code, out = supervisorctl("stop", old)
-        actions.append({"kind": "process", "program": old, "op": "stop",
-                        "ok": code == 0, "error": "" if code == 0 else out})
+        # 停旧：按逆序停止（例如先停 lxmusic 再停 lxserver）
+        old_progs = reversed(PROVIDER_PROGRAMS.get(old, [old]))
+        for prog in old_progs:
+            code, out = supervisorctl("stop", prog)
+            actions.append({"kind": "process", "program": prog, "op": "stop",
+                            "ok": code == 0, "error": "" if code == 0 else out})
     if new:
-        code, out = supervisorctl("start", new)
-        actions.append({"kind": "process", "program": new, "op": "start",
-                        "ok": code == 0, "error": "" if code == 0 else out})
+        # 起新：按顺序启动（例如先起 lxserver 再起 lxmusic）
+        new_progs = PROVIDER_PROGRAMS.get(new, [new])
+        for prog in new_progs:
+            code, out = supervisorctl("start", prog)
+            actions.append({"kind": "process", "program": prog, "op": "start",
+                            "ok": code == 0, "error": "" if code == 0 else out})
     return actions
 
 
@@ -188,9 +208,6 @@ def switch_provider_process(old: str, new: str) -> list[dict]:
 # - 只点选未保存的，PREVIEW_TTL 秒无访问后自动停止（选平台/测试源/扫码会续期）。
 PREVIEW_TTL = 300.0
 _preview_until: dict[str, float] = {}
-
-PROVIDER_PROGRAM = {"musicdl": "musicdl", "musicbox": "musicbox", "lxmusic": "lxmusic"}
-PROVIDER_HEALTH = {"musicdl": CONF["musicdl_url"], "musicbox": CONF["musicbox_url"], "lxmusic": CONF["lx_url"]}
 
 
 def preview_seconds_left(provider: str) -> float:
@@ -215,13 +232,16 @@ def preview_reap() -> list[str]:
         if provider == enabled:
             _preview_until.pop(provider, None)
         elif deadline <= time.monotonic():
-            code, out = supervisorctl("stop", PROVIDER_PROGRAM[provider])
-            if code == 0:
+            all_ok = True
+            for prog in reversed(PROVIDER_PROGRAMS.get(provider, [provider])):
+                code, out = supervisorctl("stop", prog)
+                if code != 0:
+                    all_ok = False
+                    logger.warning("预览到期但停止失败（下轮重试）%s(%s): %s", provider, prog, out)
+            if all_ok:
                 _preview_until.pop(provider, None)
                 logger.info("预览到期，停止音源进程 %s", provider)
                 stopped.append(provider)
-            else:
-                logger.warning("预览到期但停止失败（下轮重试）%s: %s", provider, out)
     return stopped
 
 
@@ -234,15 +254,59 @@ def preview_reconcile_after_save() -> list[dict]:
             _preview_until.pop(provider, None)
             continue
         _preview_until.pop(provider, None)
-        code, out = supervisorctl("stop", PROVIDER_PROGRAM[provider])
-        actions.append({"kind": "process", "program": PROVIDER_PROGRAM[provider], "op": "stop",
-                        "ok": code == 0, "error": "" if code == 0 else out, "preview": True})
+        for prog in reversed(PROVIDER_PROGRAMS.get(provider, [provider])):
+            code, out = supervisorctl("stop", prog)
+            actions.append({"kind": "process", "program": prog, "op": "stop",
+                            "ok": code == 0, "error": "" if code == 0 else out, "preview": True})
     return actions
 
 
 # ------------------------------------------------------------------ 校验 --
 
+def _normalize_lx_source_list(raw) -> str:
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return "[]"
+        try:
+            items = json.loads(text)
+        except Exception as exc:
+            raise ValueError(f"LX_SOURCE_LIST: 不是合法的 JSON 数组: {exc}") from exc
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        raise ValueError(f"LX_SOURCE_LIST: 期望 JSON 数组，收到 {type(raw).__name__}")
+
+    if not isinstance(items, list):
+        raise ValueError("LX_SOURCE_LIST: 期望 JSON 数组，收到 JSON 对象或其他类型")
+
+    normalized: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for item in items[:50]:  # 上限 50 条
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if not url:
+            continue
+        url_lower = url.lower()
+        if not (url_lower.startswith("http://") or url_lower.startswith("https://") or url_lower.startswith("file://")):
+            continue
+        if len(url) > 2000:
+            continue
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+
+        name = str(item.get("name") or "").strip()
+        name = re.sub(r"[\r\n\t]+", " ", name).strip()[:80]
+        normalized.append({"name": name, "url": url})
+
+    return json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+
+
 def _normalize_value(key: str, raw) -> str:
+    if key == "LX_SOURCE_LIST":
+        return _normalize_lx_source_list(raw)
     spec = SCHEMA[key]
     kind = spec["kind"]
     if kind == "bool":
@@ -438,9 +502,10 @@ async def api_preview(body: PreviewBody, request: Request):
     if preview_seconds_left(provider) > 0:
         preview_renew(provider)
         return {"ok": True, "preview": True, "seconds_left": preview_seconds_left(provider)}
-    code, out = supervisorctl("start", PROVIDER_PROGRAM[provider])
-    if code != 0:
-        return JSONResponse(content={"ok": False, "error": out or "supervisorctl start 失败"}, status_code=500)
+    for prog in PROVIDER_PROGRAMS.get(provider, [provider]):
+        code, out = supervisorctl("start", prog)
+        if code != 0:
+            return JSONResponse(content={"ok": False, "error": f"supervisorctl start {prog} 失败: {out}"}, status_code=500)
     client = get_http(request)
     for _ in range(60):  # 等待服务真正可用（healthz），最长约 30s
         try:

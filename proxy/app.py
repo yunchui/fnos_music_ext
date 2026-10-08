@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import glob
 import hashlib
 import math
 import json
@@ -31,7 +32,7 @@ from uuid import uuid4
 import httpx
 import anyio
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 
 try:
     from . import recommend as dailyrec
@@ -92,6 +93,11 @@ CONF = {
     "netease_wait_s": float(os.environ.get("FNMUSIC_NETEASE_WAIT_S", "3.0")),
     # 输入停满这么久才向音源发起搜索。窗口内的新词会替换旧词并重新计时。
     "search_debounce_s": float(os.environ.get("FNMUSIC_SEARCH_DEBOUNCE_S", "1.0")),
+    # 搜索深分页：本地优先布局不变，翻页越过在线首屏池时向音源增量取下一页
+    # 把本页在线段填满（直到上游取尽或 deep_max_pages 封顶）。musicdl 库无
+    # 分页参数，深分页只作用于网易/洛雪。
+    "search_deep_page": os.environ.get("FNMUSIC_SEARCH_DEEP_PAGE", "true").lower() in ("true", "1", "yes"),
+    "search_deep_max_pages": max(1, int(os.environ.get("FNMUSIC_SEARCH_DEEP_MAX_PAGES", "10"))),
     "netease_quality": os.environ.get("FNMUSIC_NETEASE_QUALITY", "lossless"),
     "netease_search_limit": int(os.environ.get("FNMUSIC_NETEASE_SEARCH_LIMIT", "50")),
     "upstream_sock": os.environ.get("FNMUSIC_UPSTREAM_SOCK", "/var/run/trim_music_upstream.socket"),
@@ -100,6 +106,7 @@ CONF = {
     "cache_dir": os.environ.get("FNMUSIC_CACHE_DIR", os.path.join(_HOME, "cache")),
     # 空=从飞牛 shared_library.path 自动探测；测试可覆盖到临时目录
     "library_dir": os.environ.get("FNMUSIC_LIBRARY_DIR", ""),
+    "cover_dir": os.environ.get("FNMUSIC_COVER_DIR", ""),
     "music_db": os.environ.get(
         "FNMUSIC_MUSIC_DB", "/usr/local/apps/@appdata/trim.music/db/music.db"
     ),
@@ -145,6 +152,9 @@ CONF = {
     # lx 平台白名单（同 .env 的 LX_SOURCES；install.sh --sources lx-<平台> 写入）；
     # 空 = 不限制。GUID 第 3 段携带平台（online:lx:kg:xxx），据此过滤与透传 ?sources=
     "lx_sources": _normalize_lx_sources(os.environ.get("LX_SOURCES", "")),
+    # 洛雪多源管理（WebUI 维护）：当前激活源地址与源列表 JSON，搜索结果来源标记用
+    "lx_source_url": (os.environ.get("LX_SOURCE_URL") or "").strip(),
+    "lx_source_list": os.environ.get("LX_SOURCE_LIST", "[]"),
     "lyric_field": os.environ.get("FNMUSIC_LYRIC_FIELD", "data.lyric"),
     "search_timeout": float(os.environ.get("FNMUSIC_SEARCH_TIMEOUT", "15")),
     "search_probe": os.environ.get("FNMUSIC_SEARCH_PROBE", "false").lower() in ("true", "1", "yes"),
@@ -451,6 +461,9 @@ def _clean_search_cache() -> None:
         task = entry.get("task")
         if task and not task.done():
             task.cancel()
+        ext = entry.get("extend_task")
+        if ext and not ext.done():
+            ext.cancel()
 
 
 def _set_search_cache(keyword: str, entry: dict) -> None:
@@ -468,7 +481,11 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_LX_ENABLED": ("lx_enabled", "bool"),
     "FNMUSIC_ONLINE_SOURCES": ("online_sources", "str"),
     "LX_SOURCES": ("lx_sources", "lx_sources"),
+    "LX_SOURCE_URL": ("lx_source_url", "str"),
+    "LX_SOURCE_LIST": ("lx_source_list", "str"),
     "FNMUSIC_SEARCH_PROBE": ("search_probe", "bool"),
+    "FNMUSIC_SEARCH_DEEP_PAGE": ("search_deep_page", "bool"),
+    "FNMUSIC_SEARCH_DEEP_MAX_PAGES": ("search_deep_max_pages", "deep_pages"),
     "FNMUSIC_QUALITY_MODE": ("quality_mode", "quality_mode"),
     "FNMUSIC_TEE_SAVE_ENABLED": ("tee_save_enabled", "bool"),
     "FNMUSIC_TEE_SAVE_DIR": ("tee_save_dir", "str"),
@@ -482,6 +499,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_RECOMMEND_HOT": ("recommend_hot", "bool"),
     "FNMUSIC_RECOMMEND_DAILY": ("recommend_daily", "bool"),
     "FNMUSIC_NETEASE_MY_PLAYLISTS": ("netease_my_playlists", "bool"),
+    "FNMUSIC_COVER_DIR": ("cover_dir", "str"),
     "FNMUSIC_COVER_ENRICH": ("cover_enrich", "bool"),
     "FNMUSIC_TRACE_FORWARD": ("trace_forward", "bool"),
     "FNMUSIC_TRANSCODE_ENABLED": ("transcode_enabled", "bool"),
@@ -554,6 +572,11 @@ def _env_watch_parse(raw: str, kind: str):
             return max(0, min(20, int(raw)))
         except (TypeError, ValueError):
             return None
+    if kind == "deep_pages":
+        try:
+            return max(1, min(50, int(raw)))
+        except (TypeError, ValueError):
+            return None
     return raw
 
 
@@ -580,8 +603,9 @@ def apply_env_hot_reload(env_path: "str | None" = None) -> list[str]:
 
 def _reset_search_cache() -> None:
     tasks = [
-        entry.get("task") for entry in _SEARCH_CACHE.values()
-        if entry.get("task") and not entry["task"].done()
+        t for entry in _SEARCH_CACHE.values()
+        for t in (entry.get("task"), entry.get("extend_task"))
+        if t and not t.done()
     ]
     for task in tasks:
         task.cancel()
@@ -902,11 +926,73 @@ def source_from_online_guid(guid: str) -> str:
     return parts[1] if len(parts) >= 3 else ""
 
 
-def build_online_track(item: dict) -> dict:
-    """对齐飞牛前端 ZQ 解构 / _h() 期望：artists、album 对象、genres 数组、audioSpec、duration 毫秒。"""
+# 搜索结果在线条目的来源标记（仅显示，不入库不影响业务逻辑）：
+# 网易盒子→[music box]，musicdl→[dl]，洛雪→激活源备注名（无备注则 [lx]）
+_SOURCE_TAG_NETEASE = "[music box] "
+_SOURCE_TAG_MUSICDL = "[dl] "
+_SOURCE_TAG_LX_FALLBACK = "[lx] "
+
+
+def _lx_source_entries() -> list[dict]:
+    try:
+        entries = json.loads(CONF.get("lx_source_list") or "[]")
+    except (TypeError, ValueError):
+        return []
+    return [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
+
+
+def _lx_source_remark() -> str:
+    """当前激活洛雪源在 LX_SOURCE_LIST 里的备注名；未匹配或未备注返回空。"""
+    url = str(CONF.get("lx_source_url") or "").strip()
+    if not url:
+        return ""
+    for entry in _lx_source_entries():
+        if str(entry.get("url") or "").strip() == url:
+            return str(entry.get("name") or "").strip()
+    return ""
+
+
+def source_display_prefix(src: str) -> str:
+    """在线条目来源标记前缀：netease→[music box]，lx→备注名或 [lx]，其余(musicdl 平台)→[dl]。"""
+    s = str(src or "").strip()
+    if s == "netease":
+        return _SOURCE_TAG_NETEASE
+    if s == "lx":
+        remark = _lx_source_remark()
+        return f"[{remark}] " if remark else _SOURCE_TAG_LX_FALLBACK
+    if s:
+        return _SOURCE_TAG_MUSICDL
+    return ""
+
+
+def strip_source_tag(title: str) -> str:
+    """剥离来源标记前缀。仅精确匹配已知标记（含列表里全部洛雪备注名），
+    不用泛化正则，避免误伤本身以方括号开头的歌名。"""
+    t = str(title or "")
+    candidates = [_SOURCE_TAG_NETEASE, _SOURCE_TAG_MUSICDL, _SOURCE_TAG_LX_FALLBACK]
+    for entry in _lx_source_entries():
+        name = str(entry.get("name") or "").strip()
+        if name:
+            candidates.append(f"[{name}] ")
+    for tag in candidates:
+        if t.startswith(tag):
+            return t[len(tag):]
+    return t
+
+
+def build_online_track(item: dict, mark_source: bool = False) -> dict:
+    """对齐飞牛前端 ZQ 解构 / _h() 期望：artists、album 对象、genres 数组、audioSpec、duration 毫秒。
+
+    mark_source=True 时在 title/name 前加来源标记（仅搜索结果列表用）；
+    收藏/历史/元数据等其余出口保持干净标题，业务逻辑一律不受标记影响。
+    """
     guid = online_guid_from_item(item)
     src = str(item.get("source") or source_from_online_guid(guid) or "")
     title = str(item.get("title") or item.get("name") or "")
+    if mark_source and title:
+        prefix = source_display_prefix(src)
+        if prefix:
+            title = prefix + title
     artist = str(item.get("artist") or "")
     album = str(item.get("album") or "")
     duration_s = item.get("duration_s") or 0
@@ -1871,22 +1957,25 @@ async def fetch_musicdl_search(client: httpx.AsyncClient, keyword: str, limit: i
     return await _MUSICDL_SEARCH_GATE.run(scope, keyword, _query)
 
 
-async def fetch_musicbox_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list[dict] | None:
+async def fetch_musicbox_search(client: httpx.AsyncClient, keyword: str, limit: int, offset: int = 0) -> list[dict] | None:
     if not keyword:
         return None
     scope = _FETCH_SCOPE.get()
 
     async def _query():
-        return await _musicbox_search_request(client, keyword, limit)
+        return await _musicbox_search_request(client, keyword, limit, offset)
 
     return await _MUSICBOX_SEARCH_GATE.run(scope, keyword, _query)
 
 
-async def _musicbox_search_request(client: httpx.AsyncClient, keyword: str, limit: int) -> list[dict] | None:
+async def _musicbox_search_request(client: httpx.AsyncClient, keyword: str, limit: int, offset: int = 0) -> list[dict] | None:
+    params: dict[str, Any] = {"keyword": keyword, "limit": limit, "type": "song"}
+    if offset > 0:
+        params["offset"] = offset
     try:
         r = await client.get(
             "/api/v1/search",
-            params={"keyword": keyword, "limit": limit, "type": "song"},
+            params=params,
             timeout=20.0,
         )
         if r.status_code != 200:
@@ -1974,27 +2063,30 @@ class _SearchItems(list):
         self.partial = partial
 
 
-async def fetch_lx_search(client: httpx.AsyncClient, keyword: str, limit: int, sources: "list[str] | str | None" = None) -> list[dict]:
+async def fetch_lx_search(client: httpx.AsyncClient, keyword: str, limit: int, sources: "list[str] | str | None" = None, page: int = 1) -> list[dict]:
     """洛雪音乐源搜索：返回统一 item（id = "lx:<source>:<identifier>"）。
 
     sources：平台白名单（列表或逗号串），None = 用 CONF["lx_sources"]；空 = 跟随 lx 服务配置。
+    page：深分页页号（1 = 首屏），透传给 lx 服务的各平台上游分页参数。
     """
     if not keyword:
         return None  # type: ignore[return-value]
     scope = _FETCH_SCOPE.get()
 
     async def _query():
-        return await _lx_search_request(client, keyword, limit, sources, scope)
+        return await _lx_search_request(client, keyword, limit, sources, scope, page)
 
     return await _LX_SEARCH_GATE.run(scope, keyword, _query)
 
 
-async def _lx_search_request(client: httpx.AsyncClient, keyword: str, limit: int, sources, scope: str) -> list[dict]:
+async def _lx_search_request(client: httpx.AsyncClient, keyword: str, limit: int, sources, scope: str, page: int = 1) -> list[dict]:
     params: dict[str, Any] = {
         "keyword": keyword,
         "limit": limit,
         "probe": 1 if CONF.get("search_probe") else 0,
     }
+    if page > 1:
+        params["page"] = page
     selected = CONF.get("lx_sources") if sources is None else sources
     if isinstance(selected, str):
         selected = [s.strip() for s in selected.split(",") if s.strip()]
@@ -2203,7 +2295,8 @@ def merge_online_tracks(
     page_online = filtered_online
 
     for it in page_online:
-        target_list.append(build_online_track(it))
+        # 搜索结果在线条目带来源标记；merge_online_tracks 仅被 search_track 调用
+        target_list.append(build_online_track(it, mark_source=True))
 
     parts = CONF["search_list_path"].split(".")
     parent = upstream_json
@@ -2978,7 +3071,10 @@ async def search_track(request: Request):
     entry = _SEARCH_CACHE.get(key)
     if entry is None:
         entry = {"items": [], "ts": 0, "keyword": keyword,
-                 "scope": _search_scope(request), "credentials": scope, "config": _source_config(), "task": None}
+                 "scope": _search_scope(request), "credentials": scope, "config": _source_config(), "task": None,
+                 # 深分页游标：deep_round=已取到的源页轮次（首轮聚合即第 1 页）；
+                 # exhausted=已取尽的源；extend_task=进行中的增量取页任务
+                 "deep_round": 1, "exhausted": set(), "extend_task": None}
         _set_search_cache(key, entry)
     entry["gen"] = _USER_SEARCH_GEN.get(scope, 0)
     entry["superseded"] = False
@@ -3022,12 +3118,22 @@ async def search_track(request: Request):
     if len(local_list) > size:
         win_start = (page - 1) * size
         local_list[:] = local_list[win_start:win_start + size]
+    # 深分页：本页在线段末尾越过在线池时，向未取尽的源增量取下一页填满本页
+    # （本地优先布局不变）。池增长后 total_online 需按新池重算。
+    if CONF.get("search_deep_page"):
+        need_end = max(0, page * size - original_total)
+        if need_end > len(entry["items"]):
+            await _wait_deep_pages(request, keyword, entry, need_end)
+            total_online = sum(1 for x in entry["items"] if (title_from_track(x), artist_from_track(x)) not in local_keys)
     # 本地优先全局布局：本地条目占据全局前 local_total 位，在线条目紧随其后。
     # 本页在线切片 = 全局分页区间与在线区间的交集；纯本地页（区间未触及在线段）
     # 在线切片为空，上游结果原样透传，只有 total 计入在线条数驱动客户端继续翻页。
     selected = _online_window(entry, page, size, original_total)
     merged = merge_online_tracks(upstream_json, selected, page=1, size=size, selected=True)
     merged["data"]["total"] = original_total + total_online
+    # 预取下一页的在线段：源未取尽且池未填满时后台先取一轮，连续翻页零等待
+    if CONF.get("search_deep_page"):
+        _schedule_deep_prefetch(request, keyword, entry, max(0, (page + 1) * size - original_total))
     fav_set = await _online_favorite_set(request)
     if fav_set and isinstance(merged.get("data"), dict) and isinstance(merged["data"].get("list"), list):
         for it in merged["data"]["list"]:
@@ -3133,6 +3239,113 @@ def _online_window(entry: dict, page: int, size: int, local_total: int) -> list[
         return []
     window = [item for item in entry["items"][start:end] if _source_enabled(online_guid_from_item(item))]
     return window
+
+
+def _deep_sources_available(entry: dict) -> bool:
+    """深分页是否还有可取的源：启用且未取尽，且未达 max_pages 封顶。"""
+    if int(entry.get("deep_round") or 1) >= max(1, int(CONF.get("search_deep_max_pages") or 10)):
+        return False
+    exhausted = entry.get("exhausted") or set()
+    for name in ("netease", "lx"):
+        if CONF.get(f"{name}_enabled") and name not in exhausted:
+            return True
+    return False
+
+
+async def _extend_search(request: Request, keyword: str, entry: dict) -> None:
+    """深分页增量取页：向未取尽的在线源取下一页并追加进在线池。
+
+    只追加不重排（_online_window 的前缀稳定承诺）。取尽判定：某源本轮
+    返回空列表，或去重后对池 0 新增（上游开始重复自身）。musicdl 库无
+    分页参数，不参与深分页。绕过代理侧取消门——翻页是用户主动行为；
+    lx 请求仍带 scope 头，lx 服务端的同词取消门自然生效。
+    """
+    scope = entry.get("credentials") or _credential_scope(request)
+    round_no = int(entry.get("deep_round") or 1)
+    if _user_search_stale(entry, scope):
+        return
+    if round_no >= max(1, int(CONF.get("search_deep_max_pages") or 10)):
+        entry.setdefault("exhausted", set()).update({"netease", "lx"})
+        return
+    token = _FETCH_SCOPE.set(scope)
+    try:
+        fetches: list[tuple[str, Any]] = []
+        exhausted = entry.setdefault("exhausted", set())
+        if CONF.get("netease_enabled") and "netease" not in exhausted:
+            limit = int(CONF["netease_search_limit"])
+            fetches.append(("netease", _musicbox_search_request(
+                get_musicbox_client(request.app), keyword, limit, offset=round_no * limit)))
+        if CONF.get("lx_enabled") and "lx" not in exhausted:
+            fetches.append(("lx", _lx_search_request(
+                get_lx_client(request.app), keyword, CONF["lx_search_limit"], None, scope, page=round_no + 1)))
+        if not fetches:
+            return
+        results = await asyncio.gather(*[coro for _, coro in fetches], return_exceptions=True)
+        if _user_search_stale(entry, scope):
+            return
+        merged = list(entry["items"])
+        for (name, _), result in zip(fetches, results):
+            if isinstance(result, BaseException):
+                # 瞬时失败不判取尽，下一轮重试
+                logger.warning("deep page fetch %s failed: %s", name, result)
+                continue
+            items = result if isinstance(result, list) else []
+            if not items:
+                exhausted.add(name)
+                continue
+            prev = len(merged)
+            merged = deduplicate_online_items(merged + items)[:2000]
+            if len(merged) == prev:
+                # 本轮 0 新增：上游开始重复自身，视为取尽
+                exhausted.add(name)
+        if len(merged) >= 2000:
+            exhausted.update({"netease", "lx"})
+        entry["items"] = merged
+        entry["deep_round"] = round_no + 1
+        entry["accessed"] = time.time()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        logger.warning("deep page extend failed for %r: %s", keyword, e)
+    finally:
+        _FETCH_SCOPE.reset(token)
+
+
+async def _wait_deep_pages(request: Request, keyword: str, entry: dict, need_end: int) -> None:
+    """确保在线池覆盖到 need_end：创建/加入增量任务并在预算内等待填满。
+
+    到点没填满就交现有切片（短页自愈：total 仍大于客户端已见条数，下次
+    翻页会再次触发）。首屏聚合仍在跑时先等它交卷，避免增量页与首屏页
+    乱序（聚合的最后写回会覆盖增量结果）。
+    """
+    if not entry.get("items"):
+        # 首屏池还空（聚合被放弃/超时）：深取第 2 页会留下永久空洞，不做
+        return
+    agg = entry.get("task")
+    if agg and not agg.done():
+        await asyncio.wait({agg}, timeout=min(10.0, max(0.05, float(CONF["search_timeout"]))))
+    deadline = asyncio.get_running_loop().time() + min(10.0, max(0.05, float(CONF["search_timeout"])))
+    while len(entry["items"]) < need_end and _deep_sources_available(entry):
+        task = entry.get("extend_task")
+        if not task or task.done():
+            task = asyncio.create_task(_extend_search(request, keyword, entry))
+            entry["extend_task"] = task
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            break
+        await asyncio.wait({task}, timeout=min(0.05, remaining))
+
+
+def _schedule_deep_prefetch(request: Request, keyword: str, entry: dict, next_need: int) -> None:
+    """预取：下一页的在线段未填满且源未取尽时后台先取一轮，连续翻页零等待。"""
+    if not entry.get("items") or next_need <= len(entry["items"]):
+        return
+    if not _deep_sources_available(entry):
+        return
+    task = entry.get("extend_task")
+    if task and not task.done():
+        return
+    entry["extend_task"] = asyncio.create_task(_extend_search(request, keyword, entry))
 
 
 @app.get("/music/api/v1/search/suggest")
@@ -5512,12 +5725,91 @@ def _placeholder_cover_response(guid: str) -> Response:
     )
 
 
+_OFFICIAL_COVER_ROOT_CACHE: str | None = None
+_OFFICIAL_COVER_MIME_CACHE: dict[str, str] = {}
+
+
+def _official_cover_root() -> str | None:
+    """获取飞牛官方封面根目录。优先读取配置/环境变量，否则自动探测 /vol*/@appmeta 目录。"""
+    configured = (os.environ.get("FNMUSIC_COVER_DIR") or CONF.get("cover_dir") or "").strip()
+    if configured:
+        if os.path.isdir(configured):
+            return configured
+        return None
+    global _OFFICIAL_COVER_ROOT_CACHE
+    if _OFFICIAL_COVER_ROOT_CACHE and os.path.isdir(_OFFICIAL_COVER_ROOT_CACHE):
+        return _OFFICIAL_COVER_ROOT_CACHE
+    candidates = sorted(glob.glob("/vol*/@appmeta/trim.music/cover"))
+    candidates.extend([
+        "/usr/local/apps/@appmeta/trim.music/cover",
+        "/usr/local/apps/@appdata/trim.music/cover",
+    ])
+    for cand in candidates:
+        if os.path.isdir(cand):
+            _OFFICIAL_COVER_ROOT_CACHE = cand
+            return cand
+    return None
+
+
+def _official_cover_file_response(cover_id: str, size: str | None = None) -> Response | None:
+    """按官方封面资源 guid 直读官方封面文件。
+    官方 coverId 格式多为 track_<32hex> 或裸 <32hex>（资源 guid 即 track.cover_guid）。
+    若存在对应文件直接返回 FileResponse，支持根据 size 参数优先返回缩略图。
+    """
+    raw_id = str(cover_id or "").strip()
+    for prefix in ("track_", "album_", "artist_", "playlist_"):
+        if raw_id.startswith(prefix):
+            raw_id = raw_id[len(prefix):]
+            break
+    if not re.fullmatch(r"[0-9a-f]{32}", raw_id, re.IGNORECASE):
+        return None
+    gid = raw_id.lower()
+    root = _official_cover_root()
+    if not root:
+        return None
+
+    size_str = str(size or "").strip()
+    candidate_names: list[str] = []
+    if size_str.isdigit():
+        candidate_names.append(f"{gid}_w{size_str}.jpg")
+    candidate_names.append(gid)
+
+    for sub in ("track", "album", "artist", "playlist"):
+        for fname in candidate_names:
+            fpath = os.path.join(root, sub, gid[:2], fname)
+            if os.path.isfile(fpath):
+                mime = _OFFICIAL_COVER_MIME_CACHE.get(fname)
+                if not mime:
+                    try:
+                        with open(fpath, "rb") as f:
+                            head = f.read(16)
+                        mime = _sniff_image_mime(head) or "image/jpeg"
+                        if len(_OFFICIAL_COVER_MIME_CACHE) > 4096:
+                            _OFFICIAL_COVER_MIME_CACHE.clear()
+                        _OFFICIAL_COVER_MIME_CACHE[fname] = mime
+                    except OSError:
+                        mime = "image/jpeg"
+                return FileResponse(
+                    fpath,
+                    media_type=mime,
+                    headers={
+                        "Cache-Control": "public, max-age=86400",
+                        "ETag": f'"{gid}"',
+                    },
+                )
+    return None
+
+
 @app.api_route("/music/api/v1/static/cover", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/static/cover/{subpath:path}", methods=["GET", "HEAD"])
 async def static_cover(request: Request, subpath: str = ""):
     guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
     if not guid and subpath.startswith("online:"):
         guid = subpath
+    if not guid and subpath:
+        cand = subpath.strip("/").split("/")[-1]
+        if cand:
+            guid = resolve_real_guid(cand)
     playlist_kind = dailyrec.online_playlist_kind(guid)
     if playlist_kind:
         upstream_client = get_upstream_client(request.app)
@@ -5531,6 +5823,9 @@ async def static_cover(request: Request, subpath: str = ""):
         if not is_online_guid(picked_guid):
             cover_id = str((picked or {}).get("coverId") or "")
             if picked and cover_id and not is_online_guid(cover_id):
+                local_resp = _official_cover_file_response(cover_id, size=request.query_params.get("size"))
+                if local_resp is not None:
+                    return local_resp
                 # 本地曲目封面：coverId 是真实官方封面 guid，透传官方静态封面端点
                 upstream_client = get_upstream_client(request.app)
                 headers = copy_incoming_headers(request)
@@ -5565,6 +5860,9 @@ async def static_cover(request: Request, subpath: str = ""):
             return RedirectResponse(cover, status_code=302)
         return Response(status_code=404)
     if not is_online_guid(guid):
+        local_resp = _official_cover_file_response(guid, size=request.query_params.get("size"))
+        if local_resp is not None:
+            return local_resp
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
     # 专辑锚点 guid（/search/album 在线专辑的 coverId）：登记时存了封面直链，直接 302
@@ -7407,6 +7705,8 @@ async def event_report(request: Request):
                             "album": payload.get("album"),
                             "albumName": payload.get("albumName"),
                         })
+                        # 客户端上报的是搜索列表里带来源标记的显示名，入库前剥离
+                        p_title = strip_source_tag(p_title)
                         title = p_title or title
                         artist = p_artist or artist
                         album = p_album or album
