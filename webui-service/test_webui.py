@@ -99,6 +99,8 @@ def test_config_view_merges_defaults(env_file):
         assert rj["values"]["FNMUSIC_LLM_MODEL"] == "gpt-4o-mini"  # 缺省补齐
         assert "CUSTOM_KEY" not in rj["values"]  # 非管理键不进视图
         assert rj["schema"]["FNMUSIC_QUALITY_MODE"]["values"] == ["high", "balanced", "smooth"]
+        assert rj["schema"]["FNMUSIC_DL_QUALITY"]["values"] == ["app", "original", "standard"]
+        assert rj["schema"]["FNMUSIC_DL_QUALITY"]["default"] == "app"
 
 
 # ------------------------------------------------------------------ PUT 校验 ---
@@ -113,6 +115,8 @@ def test_put_rejects_unknown_key(env_file):
 def test_put_rejects_bad_enum(env_file):
     with authed_client() as client:
         r = client.put("/api/config", json={"values": {"FNMUSIC_QUALITY_MODE": "ultra"}})
+        assert r.status_code == 400
+        r = client.put("/api/config", json={"values": {"FNMUSIC_DL_QUALITY": "lossless"}})
         assert r.status_code == 400
 
 
@@ -390,6 +394,147 @@ def test_lx_url_change_blocked_when_verify_fails(env_file, svctl, monkeypatch):
         assert r.status_code == 400
         assert "校验未通过" in r.json()["error"]
     assert env_file.read_text(encoding="utf-8") == before  # 校验失败不落盘
+
+
+def test_lx_multi_source_save_verifies_activates_and_derives_union(env_file, svctl, monkeypatch):
+    """多源同时激活：新源逐个 verify，LX_SOURCES 取并集，逐个 POST 激活（叠加语义）。"""
+    import json as _json
+    monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
+    hits = {"verify": [], "activate": []}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        body = {}
+        if request.method == "POST":
+            try:
+                body = _json.loads(request.content.decode())
+            except Exception:
+                body = {}
+        if url.endswith("/api/v1/source/verify"):
+            hits["verify"].append(body.get("url"))
+            platforms = ["kw", "kg"] if body.get("url") == "https://s/a.js" else ["wy"]
+            return httpx.Response(200, json={"ok": True, "data": {"platforms": platforms}})
+        if url.endswith("/api/v1/source") and request.method == "GET":
+            # 激活前读取现有启用源平台（此处为空）
+            return httpx.Response(200, json={"ok": True, "data": {"sources": []}})
+        if url.endswith("/api/v1/source"):
+            hits["activate"].append(body)
+            return httpx.Response(200, json={"ok": True, "data": {}})
+        return httpx.Response(200, json={"ok": True})
+
+    _mock_http(handler)
+
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {
+            "FNMUSIC_NETEASE_ENABLED": "false",
+            "FNMUSIC_LX_ENABLED": "true",
+            "LX_SOURCE_LIST": _json.dumps([
+                {"name": "源A", "url": "https://s/a.js", "active": True},
+                {"name": "源B", "url": "https://s/b.js", "active": True},
+            ]),
+        }})
+        assert r.status_code == 200
+        lx_actions = [a for a in r.json()["actions"] if a.get("kind") == "lx_activate"]
+    assert hits["verify"] == ["https://s/a.js", "https://s/b.js"]  # 新激活源逐个校验
+    assert len(hits["activate"]) == 2
+    assert all(b.get("enabled", True) for b in hits["activate"])
+    assert len(lx_actions) == 2 and all(a["ok"] for a in lx_actions)
+    assert {a["source"] for a in lx_actions} == {"源A", "源B"}
+    text = env_file.read_text(encoding="utf-8")
+    assert "LX_SOURCE_URL='https://s/a.js'" in text  # 派生 = 第一个激活项
+    assert "LX_SOURCES='kw,kg,wy'" in text  # 平台并集
+    saved = _json.loads(text.split("LX_SOURCE_LIST='")[1].split("'")[0])
+    assert [i["active"] for i in saved] == [True, True]
+
+
+def test_lx_multi_source_save_blocked_when_no_active(env_file, svctl, monkeypatch):
+    """lxmusic 下全部取消激活：400 拒绝，不落盘。"""
+    import json as _json
+    monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
+    _mock_http(lambda request: httpx.Response(200, json={"ok": True}))
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {
+            "FNMUSIC_NETEASE_ENABLED": "false",
+            "FNMUSIC_LX_ENABLED": "true",
+            "LX_SOURCE_LIST": _json.dumps([{"name": "甲", "url": "https://s/a.js", "active": False}]),
+        }})
+        assert r.status_code == 400
+        assert "请至少激活一个洛雪源" in r.json()["error"]
+    assert "LX_SOURCE_LIST" not in env_file.read_text(encoding="utf-8")
+
+
+def test_lx_multi_source_deactivate_reconciles(env_file, svctl, monkeypatch):
+    """取消激活：被取消项 POST enabled=false 停用；保留项重新激活确认；无新源则不 verify。"""
+    import json as _json
+    monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
+    hits = {"verify": 0, "activate": []}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        body = {}
+        if request.method == "POST":
+            try:
+                body = _json.loads(request.content.decode())
+            except Exception:
+                body = {}
+        if url.endswith("/api/v1/source/verify"):
+            hits["verify"] += 1
+            return httpx.Response(200, json={"ok": True, "data": {"platforms": ["kw"]}})
+        if url.endswith("/api/v1/source") and request.method == "GET":
+            return httpx.Response(200, json={"ok": True, "data": {"sources": [
+                {"name": "源A", "platforms": ["kw", "kg"]},
+            ]}})
+        if url.endswith("/api/v1/source"):
+            hits["activate"].append(body)
+            return httpx.Response(200, json={"ok": True, "data": {}})
+        return httpx.Response(200, json={"ok": True})
+
+    _mock_http(handler)
+    env_file.write_text(
+        "FNMUSIC_LX_ENABLED='true'\nFNMUSIC_NETEASE_ENABLED='false'\n"
+        "LX_SOURCE_URL='https://s/a.js'\n"
+        "LX_SOURCE_LIST='" + _json.dumps([
+            {"name": "源A", "url": "https://s/a.js", "active": True},
+            {"name": "源B", "url": "https://s/b.js", "active": True},
+        ]) + "'\n",
+        encoding="utf-8")
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {
+            "LX_SOURCE_LIST": _json.dumps([
+                {"name": "源A", "url": "https://s/a.js", "active": True},
+                {"name": "源B", "url": "https://s/b.js", "active": False},
+            ]),
+        }})
+        assert r.status_code == 200
+        lx_actions = [a for a in r.json()["actions"] if a.get("kind") == "lx_activate"]
+    assert hits["verify"] == 0  # 无新激活源，不触发校验
+    deactivate_bodies = [b for b in hits["activate"] if b.get("enabled") is False]
+    assert len(deactivate_bodies) == 1 and deactivate_bodies[0]["url"] == "https://s/b.js"
+    assert any(b.get("url") == "https://s/a.js" and b.get("enabled", True) for b in hits["activate"])
+    assert {a["op"] for a in lx_actions} == {"activate", "deactivate"}
+    text = env_file.read_text(encoding="utf-8")
+    assert "LX_SOURCE_URL='https://s/a.js'" in text  # 派生指针不变
+    saved = _json.loads(text.split("LX_SOURCE_LIST='")[1].split("'")[0])
+    assert [(i["name"], i["active"]) for i in saved] == [("源A", True), ("源B", False)]
+    assert "LX_SOURCES='kw,kg'" in text  # 平台并集与描述一致
+
+
+def test_lx_config_get_derives_active_for_legacy_list(env_file):
+    """旧数据兼容：列表无 active 标记时 GET /api/config 按 LX_SOURCE_URL 推导。"""
+    import json as _json
+    env_file.write_text(
+        "FNMUSIC_LX_ENABLED='true'\n"
+        "LX_SOURCE_URL='https://s/a.js'\n"
+        "LX_SOURCE_LIST='" + _json.dumps([
+            {"name": "源A", "url": "https://s/a.js"},
+            {"name": "源B", "url": "https://s/b.js"},
+        ]) + "'\n",
+        encoding="utf-8")
+    with authed_client() as client:
+        r = client.get("/api/config")
+        assert r.status_code == 200
+        saved = _json.loads(r.json()["values"]["LX_SOURCE_LIST"])
+    assert [(i["name"], i.get("active")) for i in saved] == [("源A", True), ("源B", False)]
 
 
 def test_lx_verify_endpoint_survives_non_json_upstream(env_file, monkeypatch):
@@ -765,6 +910,86 @@ def test_lx_source_list_normalizes_items_and_dedupes(env_file):
         assert loaded[1]["url"] == "https://b.com/source.js"
 
 
+# ------------------------------------------------------------------ 储存目录 ---
+
+def test_storage_dirs_schema_and_roundtrip(env_file):
+    """缓存/下载目录：dir kind、热重载；保存时归一化（尾斜杠/重复斜杠折叠）。"""
+    with authed_client() as client:
+        view = client.get("/api/config")
+        assert view.status_code == 200
+        assert view.json()["values"]["FNMUSIC_CACHE_DIR"] == ""
+        assert view.json()["values"]["FNMUSIC_TEE_SAVE_DIR"] == ""
+        for key in ("FNMUSIC_CACHE_DIR", "FNMUSIC_TEE_SAVE_DIR"):
+            meta = view.json()["schema"][key]
+            assert meta["kind"] == "dir" and meta["reload"] == "hot"
+        saved = client.put("/api/config", json={"values": {
+            "FNMUSIC_TEE_SAVE_DIR": "/vol1/music/",
+            "FNMUSIC_CACHE_DIR": "/vol2/cache//sub",
+        }})
+        assert saved.status_code == 200
+        assert set(saved.json()["changed"]) == {"FNMUSIC_TEE_SAVE_DIR", "FNMUSIC_CACHE_DIR"}
+        assert saved.json()["actions"] == []  # 热键无进程动作
+    text = env_file.read_text(encoding="utf-8")
+    assert "FNMUSIC_TEE_SAVE_DIR='/vol1/music'" in text
+    assert "FNMUSIC_CACHE_DIR='/vol2/cache/sub'" in text
+
+
+def test_put_dir_rejects_relative_dotdot_and_newline(env_file):
+    with authed_client() as client:
+        for bad in ("vol1/music", "/vol1/../etc", "/vol1/a\n/b"):
+            for key in ("FNMUSIC_TEE_SAVE_DIR", "FNMUSIC_CACHE_DIR"):
+                r = client.put("/api/config", json={"values": {key: bad}})
+                assert r.status_code == 400, (key, bad)
+                assert r.json()["error"]
+
+
+def test_put_dir_rejects_root(env_file):
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {"FNMUSIC_CACHE_DIR": "/"}})
+        assert r.status_code == 400
+        assert "根目录" in r.json()["error"]
+
+
+def test_put_dirs_reject_same_or_nested(env_file):
+    """缓存目录与下载目录不能相同或互为父子（含只改其一时按最终状态判断）。"""
+    with authed_client() as client:
+        same = client.put("/api/config", json={"values": {
+            "FNMUSIC_TEE_SAVE_DIR": "/vol1/music", "FNMUSIC_CACHE_DIR": "/vol1/music",
+        }})
+        assert same.status_code == 400
+        assert "父子" in same.json()["error"]
+        nested = client.put("/api/config", json={"values": {
+            "FNMUSIC_TEE_SAVE_DIR": "/vol1/music", "FNMUSIC_CACHE_DIR": "/vol1/music/cache",
+        }})
+        assert nested.status_code == 400
+        assert "父子" in nested.json()["error"]
+    env_file.write_text(BASE_ENV + "FNMUSIC_TEE_SAVE_DIR='/vol1/music'\n", encoding="utf-8")
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {"FNMUSIC_CACHE_DIR": "/vol1/music/cache"}})
+        assert r.status_code == 400
+        assert "父子" in r.json()["error"]
+
+
+def test_put_dirs_empty_clears_to_default(env_file):
+    """目录键清空=恢复默认/自动探测，合法且写回空值。"""
+    env_file.write_text(BASE_ENV + "FNMUSIC_CACHE_DIR='/vol2/cache'\n", encoding="utf-8")
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {"FNMUSIC_CACHE_DIR": ""}})
+        assert r.status_code == 200
+        assert "FNMUSIC_CACHE_DIR" in r.json()["changed"]
+    assert "FNMUSIC_CACHE_DIR=''" in env_file.read_text(encoding="utf-8")
+
+
+def test_fs_check_endpoint_placeholder(env_file):
+    """直连 8774（无宿主网关拦截）到达 WebUI：明确 501；且要求管理员。"""
+    with authed_client() as client:
+        r = client.post("/api/fs-check", json={"path": "/vol1/music"})
+        assert r.status_code == 501
+    with TestClient(webui.app) as client:
+        denied = client.post("/api/fs-check", json={"path": "/vol1/music"})
+        assert denied.status_code == 403
+
+
 # ------------------------------------------------------------------ 网关管理员 ---
 
 def test_api_requires_admin(env_file):
@@ -781,3 +1006,119 @@ def test_api_requires_admin(env_file):
         saved = client.put("/api/config", json={"values": {"FNMUSIC_QUALITY_MODE": "smooth"}})
         assert saved.status_code == 200
     assert "FNMUSIC_QUALITY_MODE='smooth'" in env_file.read_text(encoding="utf-8")
+
+
+def test_preview_endpoint_cleans_up_on_partial_start_failure(env_file, monkeypatch):
+    """多进程音源（如 lxmusic 的 lxserver + lxmusic）如果后一进程启动失败，应回滚停止已启动的前置进程。"""
+    calls: list[tuple[str, str]] = []
+
+    def fake_supervisorctl(cmd, prog, timeout=20.0):
+        calls.append((cmd, prog))
+        if cmd == "start" and prog == "lxmusic":
+            return 1, "failed to start lxmusic"
+        return 0, "ok"
+
+    monkeypatch.setattr(webui, "supervisorctl", fake_supervisorctl)
+    with authed_client() as client:
+        r = client.post("/api/preview", json={"provider": "lxmusic"})
+        assert r.status_code == 500
+        assert "lxmusic" not in webui._preview_until
+    # 验证 lxserver 被拉起后又被停止回滚
+    assert ("start", "lxserver") in calls
+    assert ("start", "lxmusic") in calls
+    assert ("stop", "lxserver") in calls
+
+
+def test_api_config_put_retries_lx_activate_when_env_unchanged(env_file, svctl):
+    """当 .env 已经写入 LX_SOURCE_URL，重新保存相同 URL 时即使 .env 无 diff，也必须触发 lx_activate 支持重试。"""
+    import json
+    env_content = (
+        "FNMUSIC_NETEASE_ENABLED='false'\n"
+        "FNMUSIC_MUSICDL_ENABLED='false'\n"
+        "FNMUSIC_LX_ENABLED='true'\n"
+        "LX_SOURCE_URL='http://lx.test/source.js'\n"
+    )
+    env_file.write_text(env_content, encoding="utf-8")
+    activate_calls: list[dict] = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/source":
+            activate_calls.append(json.loads(request.content.decode()))
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"ok": False})
+
+    webui.app.state.http = httpx.AsyncClient(transport=httpx.MockTransport(mock_handler))
+
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {"LX_SOURCE_URL": "http://lx.test/source.js"}})
+        assert r.status_code == 200
+        data = r.json()
+        assert data["ok"] is True
+        # 即使 changed 为空，actions 也包含 lx_activate
+        lx_actions = [a for a in data["actions"] if a["kind"] == "lx_activate"]
+        assert len(lx_actions) == 1
+        assert lx_actions[0]["ok"] is True, f"lx_activate failed with error: {lx_actions[0].get('error')}"
+    assert len(activate_calls) == 1
+    assert activate_calls[0]["url"] == "http://lx.test/source.js"
+
+
+
+def test_lx_multi_source_deleted_active_reconciles(env_file, svctl, monkeypatch):
+    """取消激活：被取消项 POST enabled=false 停用；保留项重新激活确认；无新源则不 verify。"""
+    import json as _json
+    monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
+    hits = {"verify": 0, "activate": []}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        body = {}
+        if request.method == "POST":
+            try:
+                body = _json.loads(request.content.decode())
+            except Exception:
+                body = {}
+        if url.endswith("/api/v1/source/verify"):
+            hits["verify"] += 1
+            return httpx.Response(200, json={"ok": True, "data": {"platforms": ["kw"]}})
+        if url.endswith("/api/v1/source") and request.method == "GET":
+            return httpx.Response(200, json={"ok": True, "data": {"sources": [
+                {"name": "源A", "platforms": ["kw", "kg"]},
+            ]}})
+        if url.endswith("/api/v1/source"):
+            hits["activate"].append(body)
+            return httpx.Response(200, json={"ok": True, "data": {}})
+        return httpx.Response(200, json={"ok": True})
+
+    _mock_http(handler)
+    env_file.write_text(
+        "FNMUSIC_LX_ENABLED='true'\nFNMUSIC_NETEASE_ENABLED='false'\n"
+        "LX_SOURCE_URL='https://s/a.js'\n"
+        "LX_SOURCE_LIST='" + _json.dumps([
+            {"name": "源A", "url": "https://s/a.js", "active": True},
+            {"name": "源B", "url": "https://s/b.js", "active": True},
+        ]) + "'\n",
+        encoding="utf-8")
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {
+            "LX_SOURCE_LIST": _json.dumps([
+                {"name": "源A", "url": "https://s/a.js", "active": True},
+            ]),
+        }})
+        assert r.status_code == 200
+        lx_actions = [a for a in r.json()["actions"] if a.get("kind") == "lx_activate"]
+    assert hits["verify"] == 0  # 无新激活源，不触发校验
+    deactivate_bodies = [b for b in hits["activate"] if b.get("enabled") is False]
+    assert len(deactivate_bodies) == 1 and deactivate_bodies[0]["url"] == "https://s/b.js"
+    assert any(b.get("url") == "https://s/a.js" and b.get("enabled", True) for b in hits["activate"])
+    assert {a["op"] for a in lx_actions} == {"activate", "deactivate"}
+    text = env_file.read_text(encoding="utf-8")
+    assert "LX_SOURCE_URL='https://s/a.js'" in text  # 派生指针不变
+    saved = _json.loads(text.split("LX_SOURCE_LIST='")[1].split("'")[0])
+    assert [(i["name"], i["active"]) for i in saved] == [("源A", True)]
+    assert "LX_SOURCES='kw,kg'" in text  # 平台并集与描述一致
+
+def test_lx_empty_active_list_rejected(env_file, svctl):
+    env_file.write_text("FNMUSIC_LX_ENABLED=true\nFNMUSIC_NETEASE_ENABLED=false\n")
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {"LX_SOURCE_LIST": "[]"}})
+    assert r.status_code == 400

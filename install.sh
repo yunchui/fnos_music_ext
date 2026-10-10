@@ -21,6 +21,7 @@ set -euo pipefail
 #   ./install.sh --sources musicdl --sources=2,4 形式同下
 #   ./install.sh --sources musicbox
 #   ./install.sh --sources lxmusic --lx-source-url 'https://example.com/lx.js'
+#   ./install.sh --sources lxmusic --lx-source-url 'https://a/lx1.js,https://b/lx2.js'  # 多源同时激活
 #   ./install.sh --non-interactive --sources musicdl --webui \
 #       --enable-recommend --llm-base-url https://api.example.com/v1 --llm-api-key '***'
 # ==============================================================================
@@ -54,14 +55,22 @@ LX_PLATFORMS=""
 MDL_PLATFORMS=""
 LX_EXPLICIT=0
 MDL_EXPLICIT=0
-# 洛雪自定义源脚本 URL（CLI 或向导输入；安装后校验通过才激活）
+# 洛雪自定义源脚本 URL（CLI 或向导输入；支持逗号分隔多个；安装后校验通过才激活。
+# 经下方规范化后：本机 .js 路径已复制进数据卷并转为 file://，LX_SOURCE_URLS 为逗号分隔规范 URL）
 LX_SOURCE_URL_CLI=""
+LX_SOURCE_URLS=""
 # 跳过洛雪源可用性校验（--lx-skip-verify）：直接激活，源好坏交给 WebUI 观察；
 # 用于向导/升级场景不想因源服务器临时故障中断安装
 LX_SKIP_VERIFY=0
 # WebUI 安装开关："" = 未指定（交互询问 / 非交互默认不装）
 WEBUI_CHOICE=""
 CONTAINER_NAME="fnmusic-sources"
+# 部署形态：docker（默认，单容器）| native（原生宿主机 systemd + supervisord，无 Docker）
+DEPLOY_MODE_CLI=""
+DEPLOY_MODE="docker"
+MODE_LABEL_DOCKER="Docker 单容器·按需加载"
+MODE_LABEL_NATIVE="原生宿主机·按需加载（无 Docker）"
+MODE_LABEL="${MODE_LABEL_DOCKER}"
 PIP_INDEX="${PIP_INDEX:-https://mirrors.tencent.com/pypi/simple/}"
 MUSICDL_REPO="${MUSICDL_REPO:-https://github.com/CharlesPikachu/musicdl}"
 MUSICBOX_REPO="${MUSICBOX_REPO:-https://github.com/darknessomi/musicbox}"
@@ -86,15 +95,20 @@ usage() {
                          示例: --sources musicbox
                                --sources musicdl-kuwo,musicdl-migu
                                --sources lxmusic --lx-source-url https://example.com/lx.js
+                               --sources lxmusic --lx-source-url 'https://a/lx1.js,https://b/lx2.js'（多源同时激活）
                                --sources lxmusic（无源安装，装后在管理页配置）
                          非交互缺省: musicdl
-  --lx-source-url SRC    洛雪自定义源脚本地址：http(s) URL、file:// URL 或本机 .js 文件路径
+  --lx-source-url SRC    洛雪自定义源脚本地址：http(s) URL、file:// URL 或本机 .js 文件路径，
+                         逗号分隔可同时配置多个源（全部校验通过后同时激活）
                          （本机路径会复制进 sources-data/lxmusic/uploads/ 并转为 file://；
                           留空=无源安装，装好在管理页 WebUI 配置）
   --lx-skip-verify       跳过洛雪源可用性校验（下载→init→搜索→解析→探活）直接激活；
                          源是否可用装好后在管理页 WebUI 查看，适合不想因源故障中断安装的场景
   --webui                安装管理 Web UI（仅本机 8774；由已登录的飞牛管理员打开）
   --no-webui             不安装管理 Web UI（非交互默认）
+  --deploy MODE          部署形态：docker（默认，单容器，需 Docker）或
+                         native（原生宿主机 systemd + supervisord，无需 Docker，
+                         音源直接监听 127.0.0.1 发布端口，功能与 docker 完全一致）
   --non-interactive      无交互，缺省值：音源=musicdl，不装 WebUI，不开启每日推荐
   --enable-recommend     开启大模型兜底推荐（需同时给 base-url 与 api-key；
                         仅当网易音源未启用时生效，平时每日推荐走音源原生推荐）
@@ -108,8 +122,9 @@ usage() {
   --qr                   启动终端网易云扫码登录流程
   -h, --help             显示帮助
 
-v2.0.0 起仅支持 Docker 部署（单容器按需加载）；宿主机 host 模式已移除，
-未安装 Docker 的机器将直接报错退出。核心代理仍在宿主机 systemd 运行。
+部署形态二选一：--deploy docker（默认，单容器按需加载，需 Docker）或
+--deploy native（原生宿主机 systemd + supervisord，无需 Docker）；
+同机两种形态互斥，切换部署形态请追加 --adopt。核心代理始终在宿主机 systemd 运行。
 密钥只写入仓库根目录 .env（chmod 600），不会进入 systemd 文件或日志。
 EOF
 }
@@ -416,8 +431,9 @@ parse_sources() {
 while [ $# -gt 0 ]; do
     case "$1" in
         --mode|--mode=*)
-            # v2.0.0：host 模式移除，docker 为唯一部署形态（兼容旧命令行给出明确报错）
-            log_err "v2.0.0 起不再需要 --mode：安装固定为 Docker 单容器模式（host 模式已移除）"
+            # v2.0.0：host 模式移除，docker 为缺省部署形态（兼容旧命令行给出明确报错）
+            log_err "v2.0.0 起不再需要 --mode：缺省为 Docker 单容器模式（host 模式已移除）。"
+            log_err "如需无 Docker 的原生部署，请使用: --deploy native"
             exit 1 ;;
         --sources)
             [ $# -ge 2 ] || { log_err "--sources 需要音源列表参数"; exit 1; }
@@ -431,6 +447,10 @@ while [ $# -gt 0 ]; do
         --webui) WEBUI_CHOICE="yes"; shift ;;
         --no-webui) WEBUI_CHOICE="no"; shift ;;
         --non-interactive) NON_INTERACTIVE=1; shift ;;
+        --deploy)
+            [ $# -ge 2 ] || { log_err "--deploy 需要模式参数（docker 或 native）"; exit 1; }
+            DEPLOY_MODE_CLI="${2}"; shift 2 ;;
+        --deploy=*) DEPLOY_MODE_CLI="${1#*=}"; shift ;;
         --enable-recommend) ENABLE_RECOMMEND="yes"; shift ;;
         --disable-recommend) ENABLE_RECOMMEND="no"; LLM_CLEAR=1; shift ;;
         --llm-base-url)
@@ -467,15 +487,75 @@ run_docker() {
     fi
 }
 
-# v2.0.0 仅支持 Docker：无 Docker 的机器直接报错退出安装（不再回退宿主机模式）
-if ! command -v docker >/dev/null 2>&1; then
-    log_err "未检测到 docker：v2.0.0 起 fnmusic-ext 仅支持 Docker 部署（三音源+WebUI 单容器）。"
-    log_err "请先在 fnOS「应用中心」安装 Docker 后重试。"
+# 部署形态解析：--deploy 显式指定 > .env 既有形态（升级/重装不悄悄换形态）>
+# docker 命令在但 daemon 不通维持既有硬错误 > docker 可用即 docker >
+# 无 docker 命令时交互询问改用 native。
+# Docker 路径行为与 v2.7.0 前完全一致；仅无 docker 命令或显式 --deploy native 时
+# 才进入原生模式，已有 fpk/docker 用户升级不受影响。
+resolve_deploy_mode() {
+    case "${DEPLOY_MODE_CLI}" in
+        "") ;;
+        docker|native) DEPLOY_MODE="${DEPLOY_MODE_CLI}"; return 0 ;;
+        *)
+            log_err "--deploy 仅支持 docker 或 native: ${DEPLOY_MODE_CLI}"
+            exit 1
+            ;;
+    esac
+    if [ -f "${BASE_DIR}/.env" ]; then
+        local prev
+        prev="$(sed -n "s/^[[:space:]]*\(export[[:space:]]\+\)\?FNMUSIC_DEPLOY_MODE=//p" "${BASE_DIR}/.env" 2>/dev/null | tail -1 | tr -d "\"'[:space:]")"
+        case "${prev}" in
+            docker|native) DEPLOY_MODE="${prev}"; return 0 ;;
+        esac
+    fi
+    if command -v docker >/dev/null 2>&1; then
+        if [ "${DEPLOY_MODE_CLI}" = "native" ]; then
+            DEPLOY_MODE="native"
+            return 0
+        fi
+        if ! run_docker info >/dev/null 2>&1; then
+            # docker 命令在但 daemon 不可达：维持既有硬错误语义（不静默换形态）
+            log_err "docker 服务未运行（docker info 失败）：请启动 Docker 后重试。"
+            log_err "如本机不再使用 Docker，可改用原生模式: ./install.sh --deploy native"
+            exit 1
+        fi
+        DEPLOY_MODE="docker"
+        return 0
+    fi
+    if [ "${NON_INTERACTIVE}" -eq 1 ]; then
+        log_err "未检测到 docker：Docker 模式需先安装并启动 Docker；"
+        log_err "无 Docker 机器请使用原生模式安装: ./install.sh --deploy native"
+        exit 1
+    fi
+    log_warn "未检测到 docker（本机未安装）。"
+    if [ -t 0 ]; then
+        local ans
+        # 此处尚未到向导段（prompt 未定义），直接 read；仅 tty 交互可达
+        read -r -p "是否改用原生（无 Docker，宿主机 systemd + supervisord）模式安装? [y/N] " ans || ans=""
+        case "${ans}" in
+            y|Y|yes|YES) DEPLOY_MODE="native"; return 0 ;;
+        esac
+    fi
+    log_err "未检测到 docker：已取消安装。安装 Docker 后重试，或使用 --deploy native 原生模式。"
     exit 1
-fi
-if ! run_docker info >/dev/null 2>&1; then
-    log_err "docker 服务未运行（docker info 失败）：请启动 Docker 后重试。"
-    exit 1
+}
+
+resolve_deploy_mode
+
+if [ "${DEPLOY_MODE:-docker}" = "docker" ]; then
+    MODE_LABEL="${MODE_LABEL_DOCKER}"
+    # v2.0.0 仅支持 Docker：无 Docker 的机器直接报错退出安装（不再回退宿主机模式）
+    if ! command -v docker >/dev/null 2>&1; then
+        log_err "未检测到 docker：Docker 模式需要先安装并启动 Docker。"
+        log_err "无 Docker 的机器可使用原生模式: ./install.sh --deploy native"
+        exit 1
+    fi
+    if ! run_docker info >/dev/null 2>&1; then
+        log_err "docker 服务未运行（docker info 失败）：请启动 Docker 后重试。"
+        exit 1
+    fi
+else
+    MODE_LABEL="${MODE_LABEL_NATIVE}"
 fi
 
 
@@ -532,8 +612,27 @@ precheck_environment() {
         log_info "飞牛音乐运行套接字检测正常。"
     fi
 
-    # 4. 检查 Docker 环境（v2.0.0 仅支持 Docker：核心代理仍在宿主机 systemd）
-    if command -v docker >/dev/null 2>&1; then
+    # 4. 部署形态运行时检查（核心代理始终在宿主机 systemd）
+    if [ "${DEPLOY_MODE:-docker}" = "native" ]; then
+        # 原生模式：python3 ≥ 3.10（服务代码使用 PEP 604 联合类型语法）；
+        # nodejs/ffmpeg 缺失时可由 ensure_sources_native.sh 自动补装，此处仅预检提示
+        local py_major py_minor
+        py_major="$(python3 -c 'import sys; print(sys.version_info[0])' 2>/dev/null || echo 0)"
+        py_minor="$(python3 -c 'import sys; print(sys.version_info[1])' 2>/dev/null || echo 0)"
+        if [ "${py_major}" -lt 3 ] || { [ "${py_major}" -eq 3 ] && [ "${py_minor}" -lt 10 ]; }; then
+            log_err "【版本不足】原生模式需要 Python 3.10+（当前 ${py_major}.${py_minor}）。"
+            log_err "请升级系统 python3，或改用 Docker 模式（./install.sh --deploy docker）。"
+            precheck_failed=1
+        else
+            log_info "Python ${py_major}.${py_minor} 满足原生模式要求。"
+        fi
+        if ! command -v node >/dev/null 2>&1; then
+            log_warn "未检测到 nodejs（lxserver 需要）：安装阶段将尝试 sudo apt-get 自动安装。"
+        fi
+        if ! command -v ffmpeg >/dev/null 2>&1; then
+            log_warn "未检测到 ffmpeg（musicdl 无损探针需要）：安装阶段将尝试 sudo apt-get 自动安装。"
+        fi
+    elif command -v docker >/dev/null 2>&1; then
         if run_docker info >/dev/null 2>&1; then
             log_info "Docker 容器环境已就绪。"
         else
@@ -542,27 +641,30 @@ precheck_environment() {
             precheck_failed=1
         fi
     else
-        log_err "【缺少组件】v2.0.0 起 fnmusic-ext 仅支持 Docker 部署（三音源+WebUI 单容器）。"
-        log_err "请先在 fnOS 应用中心安装 Docker，然后重试。"
+        log_err "【缺少组件】Docker 模式未检测到 docker。"
+        log_err "请先在 fnOS 应用中心安装 Docker，或改用原生模式: --deploy native"
         precheck_failed=1
     fi
 
-    # 5. 宿主机 DNS 形态检查（仅提醒）：nameserver 全部指向本机时，Docker 构建容器
-    #    无法复用宿主 DNS（Docker 剔除 127.x 后回退 8.8.8.8，国内不可达）；
+    # 5. 宿主机 DNS 形态检查（仅 Docker 构建；原生模式不经构建容器，无此限制）：
+    #    nameserver 全部指向本机时，Docker 构建容器无法复用宿主 DNS
+    #    （Docker 剔除 127.x 后回退 8.8.8.8，国内不可达）；
     #    构建层会自动注入备用公共 DNS 兜底，这里提前告知原因与手动方案
-    local usable_ns="" ns
-    for ns in $(awk '/^[[:space:]]*nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf 2>/dev/null); do
-        case "${ns}" in
-            127.*|::1|localhost) ;;
-            *) usable_ns="${ns}"; break ;;
-        esac
-    done
-    if [ -z "${usable_ns}" ]; then
-        log_warn "【前置提醒】宿主机 DNS 全部指向本机（/etc/resolv.conf 无容器可用的 nameserver）。"
-        log_warn "Docker 构建容器无法复用此类 DNS，构建时 apt/pip 将自动注入备用公共 DNS（223.5.5.5）兜底；"
-        log_warn "如构建仍报域名解析失败，可在 Docker daemon.json 配置 \"dns\": [\"223.5.5.5\"] 并重启 Docker。"
-    else
-        log_info "宿主机 DNS 可供构建容器使用（${usable_ns}）。"
+    if [ "${DEPLOY_MODE:-docker}" = "docker" ]; then
+        local usable_ns="" ns
+        for ns in $(awk '/^[[:space:]]*nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf 2>/dev/null); do
+            case "${ns}" in
+                127.*|::1|localhost) ;;
+                *) usable_ns="${ns}"; break ;;
+            esac
+        done
+        if [ -z "${usable_ns}" ]; then
+            log_warn "【前置提醒】宿主机 DNS 全部指向本机（/etc/resolv.conf 无容器可用的 nameserver）。"
+            log_warn "Docker 构建容器无法复用此类 DNS，构建时 apt/pip 将自动注入备用公共 DNS（223.5.5.5）兜底；"
+            log_warn "如构建仍报域名解析失败，可在 Docker daemon.json 配置 \"dns\": [\"223.5.5.5\"] 并重启 Docker。"
+        else
+            log_info "宿主机 DNS 可供构建容器使用（${usable_ns}）。"
+        fi
     fi
 
     if [ "${precheck_failed}" -ne 0 ]; then
@@ -729,7 +831,7 @@ prompt_llm_model() {
 
 if [ "${NON_INTERACTIVE}" -eq 0 ]; then
     echo "============================================================"
-    echo " fnmusic-ext 安装配置向导  v${FNMUSIC_VERSION}（Docker 单容器·按需加载）"
+    echo " fnmusic-ext 安装配置向导  v${FNMUSIC_VERSION}（${MODE_LABEL}）"
     echo " 音源: ${MUSICBOX_REPO}"
     echo "       ${MUSICDL_REPO}"
     echo "       lxmusic — 洛雪音乐自定义源（装后在管理页配置源脚本）"
@@ -815,47 +917,68 @@ else
     fi
 fi
 
-ensure_docker_ready
+if [ "${DEPLOY_MODE:-docker}" = "docker" ]; then
+    ensure_docker_ready
+fi
 
 parse_sources "${SOURCES_RAW}"
 
-# 洛雪自定义源：URL 可选（无源安装，装好后在管理页 WebUI 配置）；
+# 洛雪自定义源：URL 可选（无源安装，装好后在管理页 WebUI 配置），逗号分隔可配多个同时激活；
 # 传入主机上存在的 .js 文件路径时自动复制进 sources-data/lxmusic/uploads/ 并转 file:// URL
 if [ "${ENABLE_LX}" -eq 1 ]; then
-    case "${LX_SOURCE_URL_CLI}" in
-        ""|http://*|https://*|file://*) ;;
+    _lx_rest="${LX_SOURCE_URL_CLI}"
+    while [ -n "${_lx_rest}" ]; do
+        _lx_entry="${_lx_rest%%,*}"
+        case "${_lx_rest}" in
+            *,*) _lx_rest="${_lx_rest#*,}" ;;
+            *)   _lx_rest="" ;;
+        esac
+        _lx_entry="$(printf '%s' "${_lx_entry}" | tr -d '[:space:]')"
+        [ -z "${_lx_entry}" ] && continue
+        case "${_lx_entry}" in
+            http://*|https://*|file://*) ;;
+            *)
+                # 主机路径（绝对或相对）：复制进数据卷，容器内以 file:// 挂载路径访问
+                LX_HOST_FILE="${_lx_entry}"
+                if [ ! -f "${LX_HOST_FILE}" ]; then
+                    log_err "洛雪源路径不存在或不是常规文件: ${LX_HOST_FILE}"
+                    exit 1
+                fi
+                case "${LX_HOST_FILE}" in
+                    *.js|*.JS) : ;;
+                    *) log_err "洛雪源文件必须是 .js 后缀: ${LX_HOST_FILE}"; exit 1 ;;
+                esac
+                LX_UPLOAD_DIR="${BASE_DIR}/sources-data/lxmusic/uploads"
+                mkdir -p "${LX_UPLOAD_DIR}"
+                LX_BASENAME="$(basename "${LX_HOST_FILE}")"
+                if [ -e "${LX_UPLOAD_DIR}/${LX_BASENAME}" ]; then
+                    LX_BASENAME="$(date +%s)-${LX_BASENAME}"
+                fi
+                cp -f "${LX_HOST_FILE}" "${LX_UPLOAD_DIR}/${LX_BASENAME}"
+                # 洛雪源 file:// 前缀指向各形态挂载路径：docker=容器内 /data，native=宿主数据目录
+                if [ "${DEPLOY_MODE:-docker}" = "native" ]; then
+                    _lx_entry="file://${BASE_DIR}/sources-data/lxmusic/uploads/${LX_BASENAME}"
+                else
+                    _lx_entry="file:///data/lxmusic/uploads/${LX_BASENAME}"
+                fi
+                log_info "洛雪源脚本已复制到数据目录: ${LX_BASENAME}（file:// 路径）"
+                ;;
+        esac
+        case "${LX_SOURCE_URLS}" in
+            "") LX_SOURCE_URLS="${_lx_entry}" ;;
+            *)  LX_SOURCE_URLS="${LX_SOURCE_URLS},${_lx_entry}" ;;
+        esac
+    done
+    case "${LX_SOURCE_URLS}" in
+        http://*|https://*|file://*|*,*|"") ;;
         *)
-            # 主机路径（绝对或相对）：复制进数据卷，容器内以 file:// 挂载路径访问
-            LX_HOST_FILE="${LX_SOURCE_URL_CLI}"
-            if [ ! -f "${LX_HOST_FILE}" ]; then
-                log_err "洛雪源路径不存在或不是常规文件: ${LX_HOST_FILE}"
-                exit 1
-            fi
-            case "${LX_HOST_FILE}" in
-                *.js|*.JS) : ;;
-                *) log_err "洛雪源文件必须是 .js 后缀: ${LX_HOST_FILE}"; exit 1 ;;
-            esac
-            LX_UPLOAD_DIR="${BASE_DIR}/sources-data/lxmusic/uploads"
-            mkdir -p "${LX_UPLOAD_DIR}"
-            LX_BASENAME="$(basename "${LX_HOST_FILE}")"
-            if [ -e "${LX_UPLOAD_DIR}/${LX_BASENAME}" ]; then
-                LX_BASENAME="$(date +%s)-${LX_BASENAME}"
-            fi
-            cp -f "${LX_HOST_FILE}" "${LX_UPLOAD_DIR}/${LX_BASENAME}"
-            LX_SOURCE_URL_CLI="file:///data/lxmusic/uploads/${LX_BASENAME}"
-            log_info "洛雪源脚本已复制到数据卷: ${LX_BASENAME}（file:// 挂载路径）"
-            ;;
-    esac
-    if [ -z "${LX_SOURCE_URL_CLI}" ]; then
-        log_info "未提供洛雪源（无源安装）：装好后在飞牛管理员打开的管理页配置源脚本并激活"
-    fi
-    case "${LX_SOURCE_URL_CLI}" in
-        ""|http://*|https://*|file://*) : ;;
-        *)
-            log_err "洛雪源地址必须是 http(s) URL、file:// URL 或本机 .js 文件路径: ${LX_SOURCE_URL_CLI}"
+            log_err "洛雪源地址必须是 http(s) URL、file:// URL 或本机 .js 文件路径: ${LX_SOURCE_URLS}"
             exit 1
             ;;
     esac
+    if [ -z "${LX_SOURCE_URLS}" ]; then
+        log_info "未提供洛雪源（无源安装）：装好后在飞牛管理员打开的管理页配置源脚本并激活"
+    fi
 fi
 
 MDL_SUMMARY=""
@@ -879,17 +1002,24 @@ KEEP_DATA_DIR="${FNMUSIC_KEEP_DIR:-${VOL}fnmusic-ext-data}"
 RESTORED_FROM_KEEP_DIR=""
 if [ -d "${KEEP_DATA_DIR}" ] && [ ! -f "${BASE_DIR}/.env" ]; then
     log_info "检测到历史保留的音乐源与配置文件 (${KEEP_DATA_DIR})，正在恢复..."
+    RESTORE_OK=1
     (
         shopt -s dotglob nullglob
         for _k_item in "${KEEP_DATA_DIR}"/*; do
             [ -e "${_k_item}" ] || continue
             _k_name="$(basename "${_k_item}")"
             [ "${_k_name}" = "." ] || [ "${_k_name}" = ".." ] || [ "${_k_name}" = "README.txt" ] && continue
-            cp -a "${_k_item}" "${BASE_DIR}/" 2>/dev/null || true
+            if ! cp -a "${_k_item}" "${BASE_DIR}/"; then
+                exit 1
+            fi
         done
-    )
-    RESTORED_FROM_KEEP_DIR="${KEEP_DATA_DIR}"
-    log_info "历史音乐源数据已恢复至 ${BASE_DIR}"
+    ) || RESTORE_OK=0
+    if [ "${RESTORE_OK}" -eq 1 ] && [ -f "${BASE_DIR}/.env" ]; then
+        RESTORED_FROM_KEEP_DIR="${KEEP_DATA_DIR}"
+        log_info "历史音乐源数据已恢复至 ${BASE_DIR}"
+    else
+        log_warn "历史数据未完全成功恢复，将保留备份目录以防止数据丢失: ${KEEP_DATA_DIR}"
+    fi
 fi
 
 # v2.0.0 升级检测：旧 .env 三源并存（多 true）时强制重新三选一
@@ -907,7 +1037,7 @@ if [ -f "${BASE_DIR}/.env" ]; then
     fi
 fi
 
-log_info "fnmusic-ext v${FNMUSIC_VERSION}（Docker 单容器·按需加载）"
+log_info "fnmusic-ext v${FNMUSIC_VERSION}（${MODE_LABEL}）"
 log_info "音源:${SELECTED}"
 [ "${WEBUI_CHOICE}" = "yes" ] && log_info "管理 WebUI: 启用 (8774)" || log_info "管理 WebUI: 不安装"
 log_info "每日推荐: ${ENABLE_RECOMMEND}"
@@ -955,6 +1085,19 @@ WEBUI_FLAG="false"
 # 三源开关与 WebUI 开关先于 up -d 写好：entrypoint 按 .env 只拉起所选程序
 ENV_PATH="${BASE_DIR}/.env"
 umask 077
+
+# 逗号分隔 URL → LX_SOURCE_LIST JSON（[{name,url,active:true},...]，name 取 URL 尾段，装好后可在 WebUI 改名）
+lx_source_list_json() {
+    python3 -c '
+import json, sys
+urls = [u.strip() for u in (sys.argv[1] or "").split(",") if u.strip()]
+def _name(u):
+    return u.split("?")[0].split("#")[0].rstrip("/").split("/")[-1] or "lx-source"
+print(json.dumps([{"name": _name(u), "url": u, "active": True} for u in urls],
+                 ensure_ascii=False, separators=(",", ":")))
+' "$1" 2>/dev/null || echo "[]"
+}
+
 ENV_DESIRED="$(mktemp)"
 {
     echo "FNMUSIC_HOME='$(dotenv_escape "${BASE_DIR}")'"
@@ -979,15 +1122,17 @@ ENV_DESIRED="$(mktemp)"
     echo "FNMUSIC_TEE_CACHE_MAX='2'"
     echo "FNMUSIC_LX_ENABLED='${LX_FLAG}'"
     echo "FNMUSIC_LX_URL='http://127.0.0.1:8772'"
-    if [ "${ENABLE_LX}" -eq 1 ] && [ -n "${LX_SOURCE_URL_CLI}" ]; then
-        # 源 URL 种子：容器首启加载，安装后校验通过再激活并推导 LX_SOURCES
-        echo "LX_SOURCE_URL='$(dotenv_escape "${LX_SOURCE_URL_CLI}")'"
+    if [ "${ENABLE_LX}" -eq 1 ] && [ -n "${LX_SOURCE_URLS}" ]; then
+        # 源种子（全部标记激活）：容器首启/重启时按此自愈恢复多源激活；
+        # LX_SOURCE_URL 为派生兼容字段 = 第一个激活源
+        echo "LX_SOURCE_LIST='$(dotenv_escape "$(lx_source_list_json "${LX_SOURCE_URLS}")")'"
+        echo "LX_SOURCE_URL='$(dotenv_escape "${LX_SOURCE_URLS%%,*}")'"
     fi
     if [ "${LX_EXPLICIT}" -eq 1 ]; then
         echo "LX_SOURCES='$(dotenv_escape "${LX_PLATFORMS}")'"
     fi
     echo "FNMUSIC_WEBUI_ENABLED='${WEBUI_FLAG}'"
-    echo "FNMUSIC_DEPLOY_MODE='docker'"
+    echo "FNMUSIC_DEPLOY_MODE='${DEPLOY_MODE}'"
     echo "FNMUSIC_PIP_INDEX='$(dotenv_escape "${PIP_INDEX}")'"
     if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
         echo "FNMUSIC_LLM_BASE_URL='$(dotenv_escape "${LLM_BASE_URL}")'"
@@ -1006,8 +1151,8 @@ ENV_DESIRED="$(mktemp)"
 # 用户本次明确提供了新值的键（音源开关/WebUI/版本/部署模式为安装时部署选项，始终采用新值）
 ENV_EXPLICIT="FNMUSIC_MUSICDL_ENABLED,FNMUSIC_NETEASE_ENABLED,FNMUSIC_LX_ENABLED,FNMUSIC_WEBUI_ENABLED,FNMUSIC_VERSION,FNMUSIC_DEPLOY_MODE"
 [ "${ENABLE_LX}" -eq 1 ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LX_URL"
-# lx 源 URL 种子（校验通过后会再写一次推导出的 LX_SOURCES）
-[ "${ENABLE_LX}" -eq 1 ] && [ -n "${LX_SOURCE_URL_CLI}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},LX_SOURCE_URL"
+# lx 源种子（校验通过后会再写一次推导出的 LX_SOURCE_LIST/LX_SOURCES）
+[ "${ENABLE_LX}" -eq 1 ] && [ -n "${LX_SOURCE_URLS}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},LX_SOURCE_LIST,LX_SOURCE_URL"
 # 平台显式选择（向导菜单或 lx-kw/musicdl-kuwo 等 token）时覆盖平台键；裸音源 token 不动既有值
 [ "${LX_EXPLICIT}" -eq 1 ] && ENV_EXPLICIT="${ENV_EXPLICIT},LX_SOURCES"
 [ "${MDL_EXPLICIT}" -eq 1 ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_ONLINE_SOURCES,MUSICDL_SOURCES"
@@ -1067,6 +1212,47 @@ migrate_default_mirror FNMUSIC_PIP_INDEX "https://pypi.tuna.tsinghua.edu.cn/simp
 migrate_default_mirror FNMUSIC_PIP_INDEX "https://mirrors.aliyun.com/pypi/simple/" "https://mirrors.tencent.com/pypi/simple/"
 migrate_default_mirror FNMUSIC_APT_MIRROR "https://mirrors.tuna.tsinghua.edu.cn" "https://mirrors.tencent.com"
 migrate_default_mirror FNMUSIC_APT_MIRROR "https://mirrors.aliyun.com" "https://mirrors.tencent.com"
+
+# 部署形态切换迁移：docker↔native（--adopt 或显式换 --deploy）后，.env 里指向
+# 另一形态挂载路径的洛雪源 file:// URL 改写为当前形态路径。两形态共用同一份
+# sources-data（docker=容器 /data），只改 URL 不动任何数据；目标文件不存在则不动
+# （外部 URL 与异常值一律保留原样）。
+migrate_lx_url_between_modes() {
+    local current target fs_target
+    current="$(sed -n "s/^LX_SOURCE_URL=//p" "${ENV_PATH}" 2>/dev/null | tail -1 | tr -d "\"'")"
+    [ -n "${current}" ] || return 0
+    if [ "${DEPLOY_MODE:-docker}" = "native" ]; then
+        case "${current}" in
+            file:///data/lxmusic/uploads/*)
+                fs_target="${BASE_DIR}/sources-data/lxmusic/uploads/${current#file:///data/lxmusic/uploads/}"
+                target="file://${fs_target}"
+                ;;
+            *) return 0 ;;
+        esac
+    else
+        case "${current}" in
+            file://${BASE_DIR}/sources-data/lxmusic/uploads/*)
+                fs_target="${BASE_DIR}/sources-data/lxmusic/uploads/${current#file://${BASE_DIR}/sources-data/lxmusic/uploads/}"
+                target="file:///data/lxmusic/uploads/${current#file://${BASE_DIR}/sources-data/lxmusic/uploads/}"
+                ;;
+            *) return 0 ;;
+        esac
+    fi
+    if [ ! -f "${fs_target#file://}" ]; then
+        return 0
+    fi
+    local desired
+    desired="$(mktemp)"
+    { echo "LX_SOURCE_URL='$(dotenv_escape "${target}")'"; } > "${desired}"
+    python3 "${BASE_DIR}/proxy/env_merge.py" --existing "${ENV_PATH}" \
+        --desired "${desired}" --output "${ENV_PATH}" \
+        --explicit "LX_SOURCE_URL" --quiet
+    rm -f "${desired}"
+    chmod 600 "${ENV_PATH}"
+    log_info "已将洛雪源 URL 迁移为当前部署形态路径（数据原样共用）"
+}
+migrate_lx_url_between_modes
+
 rm -f "${ENV_DESIRED}"
 chmod 600 "${ENV_PATH}"
 
@@ -1131,6 +1317,7 @@ sources_quick_ready() {
 install_sources_container() {
     log_info "构建并启动单容器 ${CONTAINER_NAME}（所选音源 + WebUI 按需启动）..."
     cleanup_legacy_sources
+    remove_conflicting_native_unit || return 1
     if [ "${ADOPT:-0}" -eq 1 ]; then
         reclaim_container "${CONTAINER_NAME}" --adopt || return 1
     else
@@ -1198,106 +1385,257 @@ install_sources_container() {
     return 0
 }
 
-# 洛雪源校验回路：容器内 verify_source.py 全链路校验（下载→init→搜索→解析→探活），
-# 成功则 POST /api/v1/source 激活持久化 + 推导平台写回 .env；失败按分类提示循环重输。
+# 洛雪源校验激活回路：逐个源走 HTTP 全链路校验（下载→init→搜索→解析→探活），
+# 通过后逐个 POST /api/v1/source 叠加激活（多源同时生效），平台并集与最终激活集写回 .env；
+# 失败按分类提示循环重输。$1 = 逗号分隔的源 URL 列表。
 # --lx-skip-verify：跳过全链路校验直接激活（可用性交给 WebUI 观察，安装不中断）。
-lx_verify_and_activate() {
-    local url="${1}"
-    local report platforms
-    if [ "${LX_SKIP_VERIFY:-0}" -eq 1 ]; then
-        log_warn "已指定 --lx-skip-verify：跳过洛雪源可用性校验，直接激活"
-        if curl -sf -X POST "http://127.0.0.1:8772/api/v1/source" \
-            -H "Content-Type: application/json" \
-            -d "{\"url\": \"$(dotenv_escape "${url}")\"}" >/dev/null 2>&1; then
-            log_info "洛雪源已激活并持久化（未做可用性校验，如不可用请在 WebUI 中查看/更换）"
-        else
-            log_warn "洛雪源激活失败（脚本无法加载或 URL 不可达）：请在 WebUI(8774) 中检查源 URL"
-        fi
-        return 0
-    fi
-    while :; do
-        log_info "校验洛雪源（下载→init→搜索→解析→探活）..."
-        report="$(run_docker exec -w /srv/lxmusic-service "${CONTAINER_NAME}" \
-            python3 verify_source.py --json "${url}" 2>/dev/null || true)"
-        if [ -n "${report}" ] && printf '%s' "${report}" | python3 -c '
+lx_verify_request() {
+    curl -s --max-time 140 -X POST "http://127.0.0.1:8772/api/v1/source/verify" \
+        -H "Content-Type: application/json" \
+        -d "{\"url\": \"$(dotenv_escape "$1")\"}" 2>/dev/null || true
+}
+
+lx_report_ok() {
+    printf '%s' "${1:-}" | python3 -c '
+
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
 except Exception:
     sys.exit(1)
 sys.exit(0 if d.get("ok") else 1)
-' 2>/dev/null; then
-            platforms="$(printf '%s' "${report}" | python3 -c '
-import json, sys
-d = json.loads(sys.stdin.read())
-print(",".join(d.get("platforms") or []))
-' 2>/dev/null || true)"
-            break
-        fi
-        # 失败：提取错误分类与报告原文（verify 输出 JSON 的 error 字段）
-        local err_kind err_msg
-        err_kind="$(printf '%s' "${report}" | python3 -c '
+' 2>/dev/null
+}
+
+lx_report_platforms() {
+    printf '%s' "${1:-}" | python3 -c '
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
 except Exception:
-    sys.exit(0)
-print(d.get("category") or "unknown")
-' 2>/dev/null || true)"
-        err_msg="$(printf '%s' "${report}" | python3 -c '
+    print(""); raise SystemExit
+print(",".join((d.get("data") or {}).get("platforms") or d.get("platforms") or []))
+' 2>/dev/null || true
+}
+
+lx_report_field() {
+    printf '%s' "${1:-}" | python3 -c '
 import json, sys
+key = sys.argv[1]
 try:
     d = json.loads(sys.stdin.read())
 except Exception:
-    sys.exit(0)
-print((d.get("message") or "")[:160])
-' 2>/dev/null || true)"
-        log_warn "洛雪源校验未通过（${err_kind:-无输出}）：${url}"
-        if [ "${NON_INTERACTIVE}" -eq 1 ]; then
-            log_err "洛雪源校验未通过（${err_kind:-unknown}）：${err_msg:-verify_source.py 无输出}"
-            log_err "安装已中止。可：1) 更换源脚本 URL 后重试；2) 改选 musicdl/musicbox 音源；"
-            log_err "3) 重装时勾选/追加 --lx-skip-verify 跳过校验（装好后在管理页 WebUI 查看/重配）"
+    print(""); raise SystemExit
+data = d.get("data") or {}
+print(str(data.get(key) or d.get(key) or "")[:160])
+' "${2}" 2>/dev/null || true
+}
+
+lx_merge_csv() {
+    python3 -c '
+import sys
+a = [x for x in (sys.argv[1] or "").split(",") if x]
+for x in (sys.argv[2] or "").split(","):
+    if x and x not in a:
+        a.append(x)
+print(",".join(a))
+' "${1:-}" "${2:-}" 2>/dev/null || printf '%s' "${1:-}"
+}
+
+# --- v2.8.0a 原生（无 Docker）安装：宿主机 systemd unit + supervisord 按需加载 ---
+# 与容器形态功能等价：同一份 .env / sources-data / 发布端口（127.0.0.1:8768/8770/8772/8774），
+# proxy 侧 URL 与 healthz 契约不变；差异仅在进程承载方式（supervisord 模板见
+# container/supervisord-native.conf.in，unit 模板见 fnmusic-sources-native.service.in）。
+
+# 所选音源/WebUI 的 healthz 是否已全部就绪（native 形态用；与 sources_quick_ready 同判据）
+native_sources_quick_ready() {
+    sources_quick_ready
+}
+
+# 互斥清理：Docker 音源容器还在时原生无法绑定发布端口。
+# 本目录（或 --adopt）的容器直接移除；外部目录容器保留并报错（走 --adopt 迁移）。
+remove_conflicting_docker_container() {
+    if ! command -v docker >/dev/null 2>&1 || ! run_docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
+        return 0
+    fi
+    if [ "${ADOPT:-0}" -eq 1 ]; then
+        reclaim_container "${CONTAINER_NAME}" --adopt || return 1
+    else
+        reclaim_container "${CONTAINER_NAME}" || return 1
+    fi
+    if run_docker container inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
+        log_info "移除本目录的 Docker 音源容器（切换为原生部署，数据目录原样共用）..."
+        run_docker rm -f "${CONTAINER_NAME}" >/dev/null || return 1
+    fi
+}
+
+install_native_unit() {
+    render_native_supervisor_conf || return 1
+    local unit_tmp
+    unit_tmp="$(mktemp)"
+    render_native_placeholders "${BASE_DIR}/fnmusic-sources-native.service.in" > "${unit_tmp}"
+    if install_unit "${unit_tmp}" "/etc/systemd/system/${NATIVE_UNIT_NAME}.service"; then
+        return 0
+    fi
+    rm -f "${unit_tmp}"
+    return 1
+}
+
+install_sources_native() {
+    log_info "安装并启动原生音源服务 ${NATIVE_UNIT_NAME}.service（所选音源 + WebUI 按需启动）..."
+    cleanup_legacy_sources
+    remove_conflicting_docker_container || return 1
+    log_info "准备原生运行时（.venv-sources / supervisor / nodejs / ffmpeg / lxserver）..."
+    # 镜像配置：shell 环境优先，其次 .env（docker 形态由构建层消费的同两键）
+    local apt_mirror="${FNMUSIC_APT_MIRROR:-}"
+    if [ -z "${apt_mirror}" ]; then
+        apt_mirror="$(sed -n "s/^[[:space:]]*\(export[[:space:]]\+\)\?FNMUSIC_APT_MIRROR=//p" "${ENV_PATH}" 2>/dev/null | tail -1 | tr -d "\"'")"
+    fi
+    if ! PIP_INDEX="${PIP_INDEX}" FNMUSIC_APT_MIRROR="${apt_mirror}" \
+        bash "${BASE_DIR}/ensure_sources_native.sh"; then
+        log_err "原生运行时依赖安装失败（详见上方日志）。"
+        return 1
+    fi
+    if ! install_native_unit; then
+        log_err "原生音源 unit 安装失败（systemd）。"
+        return 1
+    fi
+    # entrypoint 只在 unit 启动时读一次 .env：开关与运行中进程集不一致时先重启对齐
+    # （等价 Docker 形态的 env_newer_than_container + docker restart 快路径）
+    if env_newer_than_native_unit && ! native_sources_quick_ready; then
+        log_info "检测到 .env 更新且所选音源未运行，重启原生音源服务使开关生效..."
+        sudo systemctl restart "${NATIVE_UNIT_NAME}.service" || return 1
+    fi
+    # 按所选音源等待 healthz（entrypoint 只拉起所选程序，其余端口无人监听是预期行为）
+    local waited=0
+    if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
+        waited=1
+        if wait_http "http://127.0.0.1:8770/healthz" 60 2; then
+            log_info "musicbox 已就绪 http://127.0.0.1:8770/healthz"
+        else
+            log_err "等待 musicbox healthz 超时"
+            diagnose_native
             return 1
         fi
-        url="$(prompt "请重新输入洛雪源 URL（直接回车保留原值重试，输入 q 放弃激活）" "${url}")"
-        case "${url}" in
-            q|Q|quit|exit)
-                log_warn "跳过洛雪源激活：lxmusic 以无源状态运行，可稍后在 WebUI 中配置"
-                return 0
-                ;;
+    fi
+    if [ "${ENABLE_MUSICDL}" -eq 1 ]; then
+        waited=1
+        if wait_http "http://127.0.0.1:8768/healthz" 90 2; then
+            log_info "musicdl 已就绪 http://127.0.0.1:8768/healthz"
+        else
+            log_err "等待 musicdl healthz 超时"
+            diagnose_native
+            return 1
+        fi
+    fi
+    if [ "${ENABLE_LX}" -eq 1 ]; then
+        waited=1
+        if wait_http "http://127.0.0.1:8772/healthz" 60 2; then
+            log_info "lxmusic 已就绪 http://127.0.0.1:8772/healthz"
+        else
+            log_err "等待 lxmusic healthz 超时"
+            diagnose_native
+            return 1
+        fi
+    fi
+    if [ "${WEBUI_FLAG}" = "true" ]; then
+        if wait_http "http://127.0.0.1:8774/healthz" 60 2; then
+            log_info "WebUI 已就绪 http://127.0.0.1:8774/healthz"
+        else
+            log_err "等待 WebUI healthz 超时"
+            diagnose_native
+            return 1
+        fi
+    fi
+    [ "${waited}" -eq 1 ] || log_warn "未选择任何音源（仅安装原生服务框架）"
+    return 0
+}
+
+
+lx_verify_and_activate() {
+    local rest="${1}"
+    local accepted=""          # 已通过校验（或已激活）的 URL，写回 .env 作为多源激活种子
+    local platforms_union=""
+    local entry report platforms err_kind err_msg give_up=0
+    if [ "${LX_SKIP_VERIFY:-0}" -eq 1 ]; then
+        log_warn "已指定 --lx-skip-verify：跳过洛雪源可用性校验，直接激活"
+    fi
+    while [ -n "${rest}" ]; do
+        entry="${rest%%,*}"
+        case "${rest}" in
+            *,*) rest="${rest#*,}" ;;
+            *)   rest="" ;;
         esac
+        [ -z "${entry}" ] && continue
+        platforms=""
+        if [ "${LX_SKIP_VERIFY:-0}" -ne 1 ]; then
+            while :; do
+                log_info "校验洛雪源（下载→init→搜索→解析→探活）: ${entry}"
+                report="$(lx_verify_request "${entry}")"
+                if lx_report_ok "${report}"; then
+                    platforms="$(lx_report_platforms "${report}")"
+                    break
+                fi
+                err_kind="$(lx_report_field "${report}" category)"
+                err_msg="$(lx_report_field "${report}" message)"
+                log_warn "洛雪源校验未通过（${err_kind:-无输出}）：${entry}"
+                if [ "${NON_INTERACTIVE}" -eq 1 ]; then
+                    log_err "洛雪源校验未通过（${err_kind:-unknown}）：${err_msg:-校验服务无响应}"
+                    log_err "安装已中止。可：1) 更换源脚本 URL 后重试；2) 改选 musicdl/musicbox 音源；"
+                    log_err "3) 重装时勾选/追加 --lx-skip-verify 跳过校验（装好后在管理页 WebUI 查看/重配）"
+                    return 1
+                fi
+                entry="$(prompt "请重新输入洛雪源 URL（直接回车保留原值重试，输入 q 放弃剩余源激活）" "${entry}")"
+                case "${entry}" in
+                    q|Q|quit|exit)
+                        log_warn "跳过剩余洛雪源激活：lxmusic 以已激活源状态运行，可稍后在 WebUI 中配置"
+                        give_up=1
+                        break
+                        ;;
+                esac
+            done
+            [ "${give_up}" -eq 1 ] && break
+            # 校验通过即纳入 .env 激活种子（激活请求失败时容器首启仍会按种子自愈）
+            case "${accepted}" in
+                "") accepted="${entry}" ;;
+                *)  accepted="${accepted},${entry}" ;;
+            esac
+        fi
+        # 激活并持久化（多源叠加语义，已启用源不受影响）
+        if curl -sf --max-time 140 -X POST "http://127.0.0.1:8772/api/v1/source" \
+            -H "Content-Type: application/json" \
+            -d "{\"url\": \"$(dotenv_escape "${entry}")\"}" >/dev/null 2>&1; then
+            log_info "洛雪源已激活并持久化: ${entry}"
+            case "${accepted}" in
+                *"${entry}"*) : ;;
+                "") accepted="${entry}" ;;
+                *)  accepted="${accepted},${entry}" ;;
+            esac
+        else
+            log_warn "洛雪源激活请求失败（服务仍以种子配置运行，可稍后在 WebUI 重试）: ${entry}"
+        fi
+        if [ -n "${platforms}" ]; then
+            platforms_union="$(lx_merge_csv "${platforms_union}" "${platforms}")"
+        fi
     done
 
-    # 激活并持久化（state.json 存 /data/lxmusic，容器重启自动恢复）
-    if curl -sf -X POST "http://127.0.0.1:8772/api/v1/source" \
-        -H "Content-Type: application/json" \
-        -d "{\"url\": \"$(dotenv_escape "${url}")\"}" >/dev/null 2>&1; then
-        log_info "洛雪源已激活并持久化"
-    else
-        log_warn "洛雪源激活请求失败（服务仍以种子 URL 运行，可稍后在 WebUI 重试）"
-    fi
-
-    # 校验通过的 URL 与推导平台写回 .env（LX_SOURCES=内置可搜索平台 ∩ 源声明平台）
-    if [ -n "${url}" ] && [ "${url}" != "${LX_SOURCE_URL_CLI}" ]; then
+    # 实际通过校验的源集合（多源）、派生激活指针与平台并集写回 .env
+    if [ -n "${accepted}" ]; then
         ENV_DESIRED2="$(mktemp)"
         {
-            echo "LX_SOURCE_URL='$(dotenv_escape "${url}")'"
+            echo "LX_SOURCE_LIST='$(dotenv_escape "$(lx_source_list_json "${accepted}")")'"
+            echo "LX_SOURCE_URL='$(dotenv_escape "${accepted%%,*}")'"
         } > "${ENV_DESIRED2}"
+        local explicit_keys="LX_SOURCE_LIST,LX_SOURCE_URL"
+        if [ -n "${platforms_union}" ]; then
+            echo "LX_SOURCES='$(dotenv_escape "${platforms_union}")'" >> "${ENV_DESIRED2}"
+            explicit_keys="${explicit_keys},LX_SOURCES"
+            log_info "洛雪源可用平台并集: ${platforms_union}（已写回 .env）"
+        fi
         python3 "${BASE_DIR}/proxy/env_merge.py" --existing "${ENV_PATH}" \
             --desired "${ENV_DESIRED2}" --output "${ENV_PATH}" \
-            --explicit "LX_SOURCE_URL" --quiet
+            --explicit "${explicit_keys}" --quiet
         rm -f "${ENV_DESIRED2}"
-    fi
-    if [ -n "${platforms}" ]; then
-        ENV_DESIRED2="$(mktemp)"
-        {
-            echo "LX_SOURCES='$(dotenv_escape "${platforms}")'"
-        } > "${ENV_DESIRED2}"
-        python3 "${BASE_DIR}/proxy/env_merge.py" --existing "${ENV_PATH}" \
-            --desired "${ENV_DESIRED2}" --output "${ENV_PATH}" \
-            --explicit "LX_SOURCES" --quiet
-        rm -f "${ENV_DESIRED2}"
-        log_info "洛雪源可用平台: ${platforms}（已写回 .env）"
     fi
     chmod 600 "${ENV_PATH}"
     return 0
@@ -1305,26 +1643,32 @@ print((d.get("message") or "")[:160])
 
 # Docker 模式：先探测可用基础镜像源（国内镜像优先直连、官方源兜底），
 # 结果写入 .env 的 FNMUSIC_BASE_IMAGE 供 compose build.args 使用；失败直接退出，不动现有部署
-if ! BASE_IMAGE="${BASE_IMAGE}" FNMUSIC_DOCKER_MIRRORS="${DOCKER_IMAGE_MIRRORS}" \
-    bash "${BASE_DIR}/ensure_base_image.sh"; then
-    log_err "基础镜像源探测失败。可设置 BASE_IMAGE 环境变量手动指定可用镜像源后重试。"
-    exit 1
+if [ "${DEPLOY_MODE:-docker}" = "docker" ]; then
+    if ! BASE_IMAGE="${BASE_IMAGE}" FNMUSIC_DOCKER_MIRRORS="${DOCKER_IMAGE_MIRRORS}" \
+        bash "${BASE_DIR}/ensure_base_image.sh"; then
+        log_err "基础镜像源探测失败。可设置 BASE_IMAGE 环境变量手动指定可用镜像源后重试。"
+        exit 1
+    fi
 fi
 
 takeover preflight --base "${BASE_DIR}"
-install_sources_container
-if [ "${ENABLE_LX}" -eq 1 ] && [ -n "${LX_SOURCE_URL_CLI}" ]; then
-    lx_verify_and_activate "${LX_SOURCE_URL_CLI}"
+if [ "${DEPLOY_MODE:-docker}" = "native" ]; then
+    install_sources_native
+else
+    install_sources_container
+fi
+if [ "${ENABLE_LX}" -eq 1 ] && [ -n "${LX_SOURCE_URLS}" ]; then
+    lx_verify_and_activate "${LX_SOURCE_URLS}"
 fi
 
 takeover preflight --base "${BASE_DIR}"
-for script in extend.sh restore.sh proxy/run_proxy.sh proxy/install_common.sh netease_login.sh ensure_base_image.sh; do
+for script in extend.sh restore.sh proxy/run_proxy.sh proxy/install_common.sh netease_login.sh ensure_base_image.sh ensure_sources_native.sh; do
     bash -n "${BASE_DIR}/${script}"
 done
 
 log_info "============================================================"
 log_info "🎉 fnmusic-ext v${FNMUSIC_VERSION} 安装配置完成！"
-log_info "已启用音源（Docker 单容器·按需加载）:${SELECTED}"
+log_info "已启用音源（${MODE_LABEL}）:${SELECTED}"
 log_info "------------------------------------------------------------"
 log_info "【音源服务状态】（未启用的音源进程不驻留内存）"
 [ "${ENABLE_MUSICBOX}" -eq 1 ] && log_info "  • musicbox  [8770] 网易云音源     http://127.0.0.1:8770/healthz"
@@ -1372,7 +1716,7 @@ if [ "${NON_INTERACTIVE}" -eq 0 ] && [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
     bash "${BASE_DIR}/netease_login.sh" || true
 fi
 
-if [ -n "${RESTORED_FROM_KEEP_DIR}" ] && [ -d "${RESTORED_FROM_KEEP_DIR}" ]; then
+if [ -n "${RESTORED_FROM_KEEP_DIR}" ] && [ -d "${RESTORED_FROM_KEEP_DIR}" ] && [ -f "${BASE_DIR}/.env" ]; then
     rm -rf "${RESTORED_FROM_KEEP_DIR}" 2>/dev/null || true
     log_info "已清理安装过渡目录: ${RESTORED_FROM_KEEP_DIR}"
 fi
@@ -1387,4 +1731,4 @@ fi
 # Without --extend the socket is not taken over yet, but this checkout still
 # owns the machine-wide resources (containers/units); register it so a second
 # checkout cannot silently take them over later.
-takeover deployment-remember --base "${BASE_DIR}" || true
+takeover deployment-remember --base "${BASE_DIR}" --deploy-mode "${DEPLOY_MODE}" || true

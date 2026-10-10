@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -71,10 +72,12 @@ SCHEMA: dict[str, dict] = {
     "LX_SOURCE_LIST": {"kind": "str", "default": "[]", "group": "lx", "reload": "hot", "label": "洛雪源列表（JSON 数组）"},
     "LX_SOURCES": {"kind": "csv", "default": "kg,wy,mg,kw", "group": "lx", "reload": "hot", "label": "lx 平台（按源声明推导）"},
     "FNMUSIC_QUALITY_MODE": {"kind": "enum", "values": ["high", "balanced", "smooth"], "default": "high", "group": "quality", "reload": "hot", "label": "音质偏好"},
+    "FNMUSIC_DL_QUALITY": {"kind": "enum", "values": ["app", "original", "standard"], "default": "app", "group": "quality", "reload": "hot", "label": "下载音质"},
     "FNMUSIC_RECOMMEND_HOT": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "热门榜单推荐"},
     "FNMUSIC_RECOMMEND_DAILY": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "每日推荐"},
     "FNMUSIC_TEE_SAVE_ENABLED": {"kind": "bool", "default": "true", "group": "tee", "reload": "hot", "label": "边听边存"},
-    "FNMUSIC_TEE_SAVE_DIR": {"kind": "str", "default": "", "group": "tee", "reload": "hot", "label": "保存路径（留空自动探测）"},
+    "FNMUSIC_TEE_SAVE_DIR": {"kind": "dir", "default": "", "group": "storage", "reload": "hot", "label": "下载目录（留空自动探测共享曲库）"},
+    "FNMUSIC_CACHE_DIR": {"kind": "dir", "default": "", "group": "storage", "reload": "hot", "label": "歌曲缓存目录（留空=安装目录 cache）"},
     "FNMUSIC_TEE_CACHE_MAX": {"kind": "int", "default": "2", "min": 1, "max": 100, "group": "tee", "reload": "hot", "label": "关闭时滚动缓存数"},
     "FNMUSIC_FAV_AUTO_BIND": {"kind": "bool", "default": "false", "group": "tee", "reload": "hot", "label": "收藏自动绑定本地"},
     "FNMUSIC_AUTO_COVER": {"kind": "bool", "default": "true", "group": "tee", "reload": "hot", "label": "自动下载封面"},
@@ -147,7 +150,9 @@ def write_env(updates: dict[str, str]) -> list[str]:
 # ------------------------------------------------------------------ supervisor --
 
 def supervisorctl(*args: str, timeout: float = 20.0) -> tuple[int, str]:
-    cmd = [CONF["supervisorctl"], *args]
+    # WEBUI_SUPERVISORCTL 可携带参数（如 "supervisorctl -c /path/supervisord.conf"），
+    # 按 shell 词法拆分；默认裸 "supervisorctl" 拆分后行为不变。
+    cmd = shlex.split(CONF["supervisorctl"]) + list(args)
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except FileNotFoundError:
@@ -299,9 +304,90 @@ def _normalize_lx_source_list(raw) -> str:
 
         name = str(item.get("name") or "").strip()
         name = re.sub(r"[\r\n\t]+", " ", name).strip()[:80]
-        normalized.append({"name": name, "url": url})
+        normalized.append({"name": name, "url": url, "active": bool(item.get("active"))})
 
     return json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+
+
+def _lx_list_items(raw) -> list[dict]:
+    """解析 LX_SOURCE_LIST JSON 字符串为 dict 列表（非法输入返回空列表）。"""
+    if isinstance(raw, list):
+        items = raw
+    else:
+        try:
+            items = json.loads(str(raw or "").strip() or "[]")
+        except Exception:
+            return []
+    if not isinstance(items, list):
+        return []
+    return [i for i in items if isinstance(i, dict)]
+
+
+def _list_active_urls(values: dict) -> set[str]:
+    """从 .env 值推导激活 URL 集合：优先列表 active 标记；无标记回退 LX_SOURCE_URL 单值（旧数据）。"""
+    urls: set[str] = set()
+    for item in _lx_list_items(values.get("LX_SOURCE_LIST")):
+        if item.get("active"):
+            url = str(item.get("url") or "").strip()
+            if url:
+                urls.add(url)
+    if not urls:
+        url = str(values.get("LX_SOURCE_URL") or "").strip()
+        if url:
+            urls.add(url)
+    return urls
+
+
+def _derive_lx_list_actives(items: list[dict], ref_url: str) -> list[dict]:
+    """兼容升级：列表无任何 active 标记时按 LX_SOURCE_URL 推导（全部项显式落布尔）。"""
+    if items and not any(i.get("active") for i in items):
+        for item in items:
+            item["active"] = bool(ref_url) and str(item.get("url") or "").strip() == ref_url
+    return items
+
+
+def _dumps_lx_list(items: list[dict]) -> str:
+    return json.dumps(items, ensure_ascii=False, separators=(",", ":"))
+
+
+async def _lx_enabled_platforms(request: Request) -> list[str]:
+    """读取 lxmusic 当前全部启用源的声明平台并集（保持出现顺序）；不可达返回空列表。"""
+    try:
+        resp = await get_http(request).get(f"{CONF['lx_url']}/api/v1/source", timeout=10.0)
+        data = _resp_json(resp)
+        sources = ((data or {}).get("data") or {}).get("sources") or []
+        platforms: list[str] = []
+        for s in sources:
+            for p in (s or {}).get("platforms") or []:
+                p = str(p).strip()
+                if p and p not in platforms:
+                    platforms.append(p)
+        return platforms
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _normalize_dir_path(label: str, raw) -> str:
+    """储存目录归一化：空值合法（=恢复默认/自动探测）；要求绝对路径、
+    拒绝 .. 段与换行/空字符；折叠多余斜杠与尾斜杠。"""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if any(ch in text for ch in "\r\n\x00"):
+        raise ValueError(f"{label}: 路径不能包含换行或空字符")
+    if not text.startswith("/"):
+        raise ValueError(f"{label}: 必须是以 / 开头的绝对路径，收到 {raw!r}")
+    segs = [seg for seg in text.split("/") if seg]
+    if not segs:
+        raise ValueError(f"{label}: 不能是根目录 /")
+    if ".." in segs:
+        raise ValueError(f"{label}: 路径不能包含 .. 段")
+    return "/" + "/".join(segs)
+
+
+def _is_dir_within(child: str, parent: str) -> bool:
+    """child 是否与 parent 相同或位于 parent 之下（均应为归一化后的绝对路径）。"""
+    return child == parent or child.startswith(parent.rstrip("/") + "/")
 
 
 def _normalize_value(key: str, raw) -> str:
@@ -309,6 +395,8 @@ def _normalize_value(key: str, raw) -> str:
         return _normalize_lx_source_list(raw)
     spec = SCHEMA[key]
     kind = spec["kind"]
+    if kind == "dir":
+        return _normalize_dir_path(spec.get("label", key), raw)
     if kind == "bool":
         if isinstance(raw, bool):
             return "true" if raw else "false"
@@ -353,6 +441,11 @@ def validate_updates(values: dict) -> dict[str, str]:
     # 三选一互斥：以"应用后的最终状态"判断
     final = dict(read_env())
     final.update(updates)
+    # 储存目录互斥：缓存目录与下载目录不能相同或互为父子（否则滚动缓存被官方扫描进曲库）
+    final_cache = (final.get("FNMUSIC_CACHE_DIR") or "").strip()
+    final_dl = (final.get("FNMUSIC_TEE_SAVE_DIR") or "").strip()
+    if final_cache and final_dl and (_is_dir_within(final_cache, final_dl) or _is_dir_within(final_dl, final_cache)):
+        raise ValueError("歌曲缓存目录与下载目录不能相同或互为父子目录")
     enabled = [name for name, key in PROVIDERS.items()
                if final.get(key, SCHEMA[key]["default"]).lower() in ("true", "1", "yes")]
     if len(enabled) > 1:
@@ -475,6 +568,12 @@ async def api_status(request: Request):
 @app.get("/api/config")
 async def api_config():
     values = read_env()
+    # 兼容升级：列表项缺 active 标记时按 LX_SOURCE_URL 推导（旧数据一次加载即升级）
+    ref_url = str(values.get("LX_SOURCE_URL") or "").strip()
+    if ref_url:
+        items = _derive_lx_list_actives(_lx_list_items(values.get("LX_SOURCE_LIST")), ref_url)
+        if items:
+            values["LX_SOURCE_LIST"] = _dumps_lx_list(items)
     return {
         "ok": True,
         "values": {key: values.get(key, spec["default"]) for key, spec in SCHEMA.items()},
@@ -502,19 +601,29 @@ async def api_preview(body: PreviewBody, request: Request):
     if preview_seconds_left(provider) > 0:
         preview_renew(provider)
         return {"ok": True, "preview": True, "seconds_left": preview_seconds_left(provider)}
+    started: list[str] = []
     for prog in PROVIDER_PROGRAMS.get(provider, [provider]):
         code, out = supervisorctl("start", prog)
         if code != 0:
+            for p in reversed(started):
+                supervisorctl("stop", p)
             return JSONResponse(content={"ok": False, "error": f"supervisorctl start {prog} 失败: {out}"}, status_code=500)
+        started.append(prog)
     client = get_http(request)
+    healthy = False
     for _ in range(60):  # 等待服务真正可用（healthz），最长约 30s
         try:
             r = await client.get(f"{PROVIDER_HEALTH[provider]}/healthz", timeout=2.0)
             if r.status_code == 200:
+                healthy = True
                 break
         except httpx.HTTPError:
             pass
         await asyncio.sleep(0.5)
+    if not healthy:
+        for p in reversed(started):
+            supervisorctl("stop", p)
+        return JSONResponse(content={"ok": False, "error": f"{provider} 启动后未能通过健康检查"}, status_code=504)
     _preview_until[provider] = time.monotonic() + PREVIEW_TTL
     return {"ok": True, "preview": True, "seconds_left": PREVIEW_TTL}
 
@@ -527,16 +636,55 @@ async def api_config_put(body: ConfigBody, request: Request):
     except ValueError as exc:
         return JSONResponse(content={"ok": False, "error": str(exc)}, status_code=400)
 
-    # lx 换源前置校验：新 URL 必须先通过 lxmusic verify 才写入
-    lx_url_changed = updates.get("LX_SOURCE_URL") not in (None, before.get("LX_SOURCE_URL", ""))
     after_preview = dict(before)
     after_preview.update(updates)
-    if lx_url_changed and current_provider(after_preview) == "lxmusic":
-        new_url = updates["LX_SOURCE_URL"]
-        client = get_http(request)
+    lx_provider = current_provider(after_preview) == "lxmusic"
+
+    # lx 多源激活集合：active_items 待激活列表、to_activate 新激活（需校验）、to_deactivate 被取消激活
+    active_items: list[dict] = []
+    to_activate: list[dict] = []
+    to_deactivate: list[dict] = []
+    lx_reconcile = False
+    if lx_provider and "LX_SOURCE_LIST" in updates:
+        items = _derive_lx_list_actives(
+            _lx_list_items(updates["LX_SOURCE_LIST"]),
+            str(updates.get("LX_SOURCE_URL") or after_preview.get("LX_SOURCE_URL") or "").strip(),
+        )
+        active_items = [i for i in items if i.get("active") and str(i.get("url") or "").strip()]
+        if not active_items:
+            return JSONResponse(
+                content={"ok": False, "error": "请至少激活一个洛雪源"}, status_code=400
+            )
+        if active_items:
+            lx_reconcile = True
+            # LX_SOURCE_URL 退化为派生兼容字段 = 第一个激活项
+            updates["LX_SOURCE_URL"] = str(active_items[0]["url"]).strip()
+            after_preview["LX_SOURCE_URL"] = updates["LX_SOURCE_URL"]
+            before_active = _list_active_urls(before)
+            to_activate = [i for i in active_items
+                           if str(i["url"]).strip() not in before_active]
+            before_items = {str(i.get("url") or "").strip(): i for i in _lx_list_items(before.get("LX_SOURCE_LIST"))}
+            new_active = {str(i["url"]).strip() for i in active_items}
+            to_deactivate = [before_items.get(url, {"url": url})
+                             for url in before_active if url not in new_active]
+            updates["LX_SOURCE_LIST"] = _dumps_lx_list(items)
+
+    # lx 换源前置校验：新激活的源必须先通过 lxmusic verify 才写入
+    lx_url_changed = updates.get("LX_SOURCE_URL") not in (None, before.get("LX_SOURCE_URL", ""))
+    verify_urls: list[str] = []
+    if lx_provider:
+        if lx_reconcile:
+            verify_urls = [str(i["url"]).strip() for i in to_activate]
+        elif lx_url_changed:
+            verify_urls = [str(updates["LX_SOURCE_URL"] or "").strip()]
+    client = get_http(request)
+    union_acc: list[str] = []  # LX_SOURCES 推导：新激活源声明平台 ∪ 现有启用源声明平台
+    for url in verify_urls:
+        if not url:
+            continue
         try:
             resp = await client.post(f"{CONF['lx_url']}/api/v1/source/verify",
-                                     json={"url": new_url}, timeout=130.0)
+                                     json={"url": url}, timeout=130.0)
             report = _resp_json(resp)
         except Exception as exc:  # noqa: BLE001
             report = {"ok": False, "data": {"message": str(exc)}}
@@ -545,34 +693,66 @@ async def api_config_put(body: ConfigBody, request: Request):
             return JSONResponse(
                 content={"ok": False, "error": f"洛雪源校验未通过：{message}"}, status_code=400
             )
-        platforms = (report.get("data") or {}).get("platforms") or []
-        if platforms:
-            updates.setdefault("LX_SOURCES", ",".join(platforms))
+        # LX_SOURCES 推导累计各新激活源声明平台
+        for p in (report.get("data") or {}).get("platforms") or []:
+            p = str(p).strip()
+            if p and p not in union_acc:
+                union_acc.append(p)
+
+    if lx_reconcile:
+        # 并入现有启用源声明平台（激活前读取，保持出现顺序）
+        for p in await _lx_enabled_platforms(request):
+            p = str(p).strip()
+            if p and p not in union_acc:
+                union_acc.append(p)
+    if union_acc:
+        updates.setdefault("LX_SOURCES", ",".join(union_acc))
 
     old_provider = current_provider(before)
     changed = write_env(updates)
-    if not changed:
-        return {"ok": True, "changed": [], "actions": [], "note": "配置无变化"}
-
     after = read_env()
     new_provider = current_provider(after)
     actions: list[dict] = []
 
+    # 即使 .env 内容无 diff，若显式提交了 LX_SOURCE_URL/LX_SOURCE_LIST 且当前是 lxmusic，仍应重试激活
+    force_lx_activate = (
+        new_provider == "lxmusic"
+        and ("LX_SOURCE_URL" in updates or "LX_SOURCE_LIST" in updates)
+        and bool(after.get("LX_SOURCE_URL") or after.get("LX_SOURCE_LIST"))
+    )
+
+    if not changed and not force_lx_activate and not _preview_until:
+        return {"ok": True, "changed": [], "actions": [], "note": "配置无变化"}
+
     # 音源切换（先停旧再起新）
     if old_provider != new_provider:
         actions.extend(switch_provider_process(old_provider, new_provider))
-    # lx 换源激活：热切换 SOURCE_MANAGER（进程刚被拉起时 state.json 仍是旧源，必须显式激活）
-    if new_provider == "lxmusic" and lx_url_changed:
-        client = get_http(request)
+
+    async def _lx_source_post(payload: dict, source: str, op: str) -> None:
         try:
             resp = await client.post(f"{CONF['lx_url']}/api/v1/source",
-                                     json={"url": after["LX_SOURCE_URL"]}, timeout=130.0)
-            payload = _resp_json(resp)
-            ok = resp.status_code == 200 and payload.get("ok", False)
-            err = "" if ok else (payload.get("error") or f"HTTP {resp.status_code}")
+                                     json=payload, timeout=130.0)
+            api_payload = _resp_json(resp)
+            ok = resp.status_code == 200 and api_payload.get("ok", False)
+            err = "" if ok else (api_payload.get("error") or f"HTTP {resp.status_code}")
         except Exception as exc:  # noqa: BLE001
             ok, err = False, str(exc)
-        actions.append({"kind": "lx_activate", "ok": ok, "error": err or ""})
+        actions.append({"kind": "lx_activate", "op": op, "source": source,
+                        "ok": ok, "error": err or ""})
+
+    # lx 多源对账激活：停用被取消项，再按列表顺序叠加激活全部 active 项
+    if new_provider == "lxmusic" and (lx_reconcile or lx_url_changed or force_lx_activate):
+        if lx_reconcile:
+            for item in to_deactivate:
+                url = str(item.get("url") or "").strip()
+                await _lx_source_post({"url": url, "enabled": False},
+                                      str(item.get("name") or "") or url, "deactivate")
+            for item in active_items:
+                url = str(item["url"]).strip()
+                await _lx_source_post({"url": url},
+                                      str(item.get("name") or "") or url, "activate")
+        else:
+            await _lx_source_post({"url": after["LX_SOURCE_URL"]}, "", "activate")
     elif new_provider == "musicdl" and (
         "FNMUSIC_ONLINE_SOURCES" in changed or "MUSICDL_SOURCES" in changed
     ):
@@ -708,6 +888,17 @@ async def netease_qr(unikey: str = Query(...)):
     buf = io.BytesIO()
     img.save(buf)
     return Response(content=buf.getvalue(), media_type="image/svg+xml")
+
+
+@app.post("/api/fs-check")
+async def api_fs_check():
+    """目录权限校验占位端点（直连 8774 场景）。
+
+    桌面链路（统一网关）中该路径由宿主机侧 webui_gateway（root）拦截应答，
+    不会到达这里；能到达说明是独立浏览器/直连端口环境，WebUI 容器内看不到
+    宿主机真实目录，无法给出可信的可写性结论，明确回 501 让前端降级放行。
+    """
+    raise HTTPException(status_code=501, detail="直连模式不支持目录权限校验，请在飞牛桌面内打开管理台")
 
 
 # ------------------------------------------------------------------ 静态前端 --

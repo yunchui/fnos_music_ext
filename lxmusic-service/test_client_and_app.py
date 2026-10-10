@@ -222,10 +222,24 @@ def test_source_management_endpoints(test_app_client, fake_lx):
     res = test_app_client.post("/api/v1/source", json={"url": data["url"]})
     assert res.status_code == 200
     assert res.json()["ok"] is True
-    # 单源语义：目标启用、其余禁用
+    # 多源叠加语义：目标启用、既有激活源保持不变
     states = {s["id"]: s["enabled"] for s in fake_lx.sources}
     assert states.get("MyTest.js") is True
-    assert states.get("source1") is False
+    assert states.get("source1") is True
+
+    # enabled=false：停用目标源，其余不受影响
+    res = test_app_client.post("/api/v1/source", json={"url": data["url"], "enabled": False})
+    assert res.status_code == 200
+    states = {s["id"]: s["enabled"] for s in fake_lx.sources}
+    assert states.get("MyTest.js") is False
+    assert states.get("source1") is True
+
+    # describe 返回全部启用源列表
+    res = test_app_client.get("/api/v1/source")
+    src_data = res.json()["data"]
+    assert src_data["configured"] is True
+    assert src_data["active_count"] == 1
+    assert [s["id"] for s in src_data["sources"]] == ["source1"]
 
     # DELETE /api/v1/source (清除)
     res = test_app_client.delete("/api/v1/source")
@@ -339,3 +353,462 @@ def test_verify_source_json_format_guard():
     assert _looks_like_json_source('[{"api": 1}]') is True
     assert _looks_like_json_source("/* @name test */ console.log(1);") is False
 
+
+def test_source_set_http_url_activates_target(test_app_client, fake_lx):
+    """测试通过 HTTP URL 设置源，能够正确导入并激活该源（多源叠加，不动既有源）。"""
+    res = test_app_client.post("/api/v1/source", json={"url": "https://example.com/remote_source.js"})
+    assert res.status_code == 200
+    assert res.json()["ok"] is True
+    assert "https://example.com/remote_source.js" in fake_lx.import_calls
+    # 验证目标源已被激活，旧激活源保持不变
+    states = {s["id"]: s["enabled"] for s in fake_lx.sources}
+    assert states.get("remote_source.js") is True
+    assert states.get("source1") is True
+
+
+def test_activate_nonexistent_source_does_not_disable_existing():
+    """激活不存在的目标源时，不应当误将当前运行中的源全部禁用。"""
+    from lxserver_client import LxServerClient
+
+    client = LxServerClient(base_url="http://test")
+    # 模拟已有激活源
+    sources = [
+        {"id": "source1", "name": "source1", "enabled": True},
+        {"id": "source2", "name": "source2", "enabled": False},
+    ]
+    toggled = []
+
+    async def fake_list():
+        return list(sources)
+
+    async def fake_toggle(sid, enable):
+        toggled.append((sid, enable))
+        return True
+
+    client.list_custom_sources = fake_list
+    client.toggle_custom_source = fake_toggle
+
+    ok = asyncio.run(client.set_source_enabled("non_existent_source", True))
+    assert ok is False
+    # 没有任何 toggle 被执行，旧源保持原样
+    assert toggled == []
+
+
+def test_set_source_enabled_overlay_semantics():
+    """set_source_enabled 只改目标源启用态，多源可同时启用。"""
+    from lxserver_client import LxServerClient
+
+    client = LxServerClient(base_url="http://test")
+    sources = [
+        {"id": "source1", "name": "source1", "enabled": True},
+        {"id": "source2", "name": "source2", "enabled": False},
+    ]
+    toggled = []
+
+    async def fake_list():
+        return list(sources)
+
+    async def fake_toggle(sid, enable):
+        toggled.append((sid, enable))
+        for s in sources:
+            if s["id"] == sid:
+                s["enabled"] = enable
+        return True
+
+    client.list_custom_sources = fake_list
+    client.toggle_custom_source = fake_toggle
+
+    assert asyncio.run(client.set_source_enabled("source2", True)) is True
+    assert toggled == [("source2", True)]
+    assert {s["id"]: s["enabled"] for s in sources} == {"source1": True, "source2": True}
+
+    # 支持按名称匹配
+    assert asyncio.run(client.set_source_enabled("source1", False)) is True
+    assert toggled == [("source2", True), ("source1", False)]
+
+
+def test_source_capabilities_union_of_enabled_sources():
+    """多源同时激活时 capabilities 按启用源平台并集判定。"""
+    from app import source_capabilities
+    import app as lxapp
+
+    orig_lx = lxapp.LXSERVER
+    try:
+        class MultiClient:
+            async def is_alive(self):
+                return True
+
+            async def list_custom_sources(self):
+                return [
+                    {"id": "a.js", "name": "a", "enabled": True, "supportedSources": ["kw", "kg"]},
+                    {"id": "b.js", "name": "b", "enabled": True, "supportedSources": ["wy", "tx"]},
+                    {"id": "c.js", "name": "c", "enabled": False, "supportedSources": ["mg"]},
+                ]
+
+        lxapp.LXSERVER = MultiClient()
+        caps = asyncio.run(source_capabilities())
+        assert caps["kw"]["playback_available"] is True
+        assert caps["kg"]["playback_available"] is True
+        assert caps["wy"]["playback_available"] is True
+        assert caps["tx"]["playback_available"] is True
+        assert caps["mg"]["playback_available"] is False
+        assert "not supported" in caps["mg"]["reason"]
+    finally:
+        lxapp.LXSERVER = orig_lx
+
+
+def test_describe_user_source_lists_all_enabled():
+    """describe 返回全部启用源（sources 数组 + active_count），兼容字段取第一个。"""
+    from app import describe_user_source
+    import app as lxapp
+
+    orig_lx = lxapp.LXSERVER
+    try:
+        class MultiClient:
+            async def list_custom_sources(self):
+                return [
+                    {"id": "a.js", "name": "src-a", "enabled": True, "version": "1.0",
+                     "supportedSources": ["kw", "kg"]},
+                    {"id": "b.js", "name": "src-b", "enabled": True, "version": "2.0",
+                     "supportedSources": ["wy"]},
+                    {"id": "c.js", "name": "src-c", "enabled": False, "version": "1.0",
+                     "supportedSources": ["mg"]},
+                ]
+
+        lxapp.LXSERVER = MultiClient()
+        desc = asyncio.run(describe_user_source())
+        assert desc["configured"] is True
+        assert desc["active_count"] == 2
+        assert [s["id"] for s in desc["sources"]] == ["a.js", "b.js"]
+        assert [s["platforms"] for s in desc["sources"]] == [["kw", "kg"], ["wy"]]
+        assert desc["source"]["name"] == "src-a"
+    finally:
+        lxapp.LXSERVER = orig_lx
+
+
+def test_source_capabilities_reflects_failed_status():
+    """当激活源状态为 failed 时，playback_available 应为 False 并给出错误原因。"""
+    from app import source_capabilities
+    import app as lxapp
+
+    orig_lx = lxapp.LXSERVER
+    try:
+        class FailedClient:
+            async def is_alive(self):
+                return True
+
+            async def list_custom_sources(self):
+                return [{
+                    "id": "bad.js",
+                    "name": "bad",
+                    "enabled": True,
+                    "status": "failed",
+                    "error": "script crashed",
+                    "supportedSources": ["kw"],
+                }]
+
+        lxapp.LXSERVER = FailedClient()
+        caps = asyncio.run(source_capabilities())
+        for plat, info in caps.items():
+            assert info["playback_available"] is False
+            assert "failed" in info["reason"]
+    finally:
+        lxapp.LXSERVER = orig_lx
+
+
+
+def test_env_active_source_urls_parsing(monkeypatch):
+    """LX_SOURCE_LIST 环境变量解析：仅取 active 标记项的 URL，非法输入返回空。"""
+    from app import _env_active_source_urls
+
+    monkeypatch.setenv("LX_SOURCE_LIST", json.dumps([
+        {"name": "a", "url": "https://s/a.js", "active": True},
+        {"name": "b", "url": "https://s/b.js", "active": False},
+        {"name": "c", "url": "https://s/c.js", "active": True},
+        {"name": "d", "url": "", "active": True},
+    ]))
+    assert _env_active_source_urls() == ["https://s/a.js", "https://s/c.js"]
+
+    monkeypatch.setenv("LX_SOURCE_LIST", "not-json")
+    assert _env_active_source_urls() == []
+    monkeypatch.setenv("LX_SOURCE_LIST", "")
+    assert _env_active_source_urls() == []
+    monkeypatch.delenv("LX_SOURCE_LIST", raising=False)
+    assert _env_active_source_urls() == []
+
+
+def test_bootstrap_migration_restores_multi_active_sources(tmp_path, monkeypatch):
+    """lxserver 无启用源（数据卷被清）时，按 LX_SOURCE_LIST 的 active 标记叠加恢复多源。"""
+    from conftest import FakeLxServerClient
+
+    fake = FakeLxServerClient()
+    for s in fake.sources:
+        s["enabled"] = False
+    orig_lx = lxapp.LXSERVER
+    monkeypatch.setattr(lxapp, "LXSERVER", fake)
+    monkeypatch.setenv("LX_DATA_DIR", str(tmp_path))  # 无历史 uploads/state.json
+    monkeypatch.setenv("LX_SOURCE_LIST", json.dumps([
+        {"name": "a", "url": "https://s/a.js", "active": True},
+        {"name": "b", "url": "https://s/b.js", "active": False},
+    ]))
+    monkeypatch.delenv("LX_SOURCE_URL", raising=False)
+    try:
+        asyncio.run(lxapp._bootstrap_migration())
+    finally:
+        lxapp.LXSERVER = orig_lx
+    states = {s["id"]: s["enabled"] for s in fake.sources}
+    # a.js 经导入 + 激活；既有 source1 保持停用（叠加语义不误开）
+    assert states.get("a.js") is True
+    assert states.get("source1") is False
+
+
+def test_bootstrap_migration_falls_back_to_single_url(tmp_path, monkeypatch):
+    """旧数据兼容：LX_SOURCE_LIST 无 active 标记时回退 LX_SOURCE_URL 单值激活。"""
+    from conftest import FakeLxServerClient
+
+    fake = FakeLxServerClient()
+    for s in fake.sources:
+        s["enabled"] = False
+    orig_lx = lxapp.LXSERVER
+    monkeypatch.setattr(lxapp, "LXSERVER", fake)
+    monkeypatch.setenv("LX_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("LX_SOURCE_LIST", json.dumps([
+        {"name": "a", "url": "https://s/a.js", "active": False},
+    ]))
+    monkeypatch.setenv("LX_SOURCE_URL", "file:///x/source1")
+    try:
+        asyncio.run(lxapp._bootstrap_migration())
+    finally:
+        lxapp.LXSERVER = orig_lx
+    states = {s["id"]: s["enabled"] for s in fake.sources}
+    assert states.get("source1") is True
+    assert "https://s/a.js" not in fake.import_calls
+# ------------------------------------------------- 播放直链缓存与并发合并 --
+# issue #45：同曲同音质重复解析治理——成功缓存、失败负缓存、探活续期、
+# 同键在途合并、fresh 旁路与切源失效。
+
+def _flac_probe_handler(request: httpx.Request) -> httpx.Response:
+    """探活 mock：dead 链接模拟直链过期后 CDN 拒绝，其余返回合法 flac 前缀。"""
+    if "dead" in str(request.url):
+        return httpx.Response(200, headers={"Content-Type": "text/html"}, content=b"<html>gone</html>")
+    return httpx.Response(
+        206,
+        headers={"Content-Type": "audio/flac", "Content-Range": "bytes 0-4095/30000000"},
+        content=b"fLaC" + b"\x00" * 4092,
+    )
+
+
+@pytest.fixture
+def fresh_url_cache():
+    """隔离模块级直链缓存/在途/熔断状态。"""
+    lxapp._URL_CACHE.clear()
+    lxapp._URL_INFLIGHT.clear()
+    lxapp._CHAIN_HEALTH.pop("user_source", None)
+    yield
+    lxapp._URL_CACHE.clear()
+    lxapp._URL_INFLIGHT.clear()
+
+
+def test_track_url_success_cache_reuses_resolution(test_app_client, fresh_url_cache, fake_lx):
+    """同曲同音质连续请求：第二次命中缓存，音源仅解析一次（issue #45 主诉求）。"""
+    orig_client = lxapp.app.state.client
+    lxapp.app.state.client = mock_client(_flac_probe_handler)
+    try:
+        r1 = test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless")
+        r2 = test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless")
+    finally:
+        lxapp.app.state.client = orig_client
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert len(fake_lx.url_calls) == 1
+    assert r1.json()["data"]["url"] == r2.json()["data"]["url"] == "https://media.test/song.flac"
+
+
+@pytest.mark.asyncio
+async def test_track_url_concurrent_requests_merge_inflight(fake_lx, fresh_url_cache):
+    """同键并发请求共享一次实际解析（在途 Future 合并），不放大音源调用量。"""
+    gate = asyncio.Event()
+    fake_lx.url_gate = gate
+    probe_client = mock_client(_flac_probe_handler)
+    item = {"id": "lx:kw:5886682", "lx_source": "kw"}
+    leader = asyncio.create_task(lxapp._resolve_url_cached(probe_client, "kw", item, "lossless", 20.0))
+    while not fake_lx.url_calls:
+        await asyncio.sleep(0.01)
+    followers = [
+        asyncio.create_task(lxapp._resolve_url_cached(probe_client, "kw", item, "lossless", 20.0))
+        for _ in range(2)
+    ]
+    await asyncio.sleep(0.05)
+    assert len(fake_lx.url_calls) == 1  # 等待期间未新增解析
+    gate.set()
+    results = await asyncio.gather(leader, *followers)
+    assert len(fake_lx.url_calls) == 1
+    assert all(r["url"] == results[0]["url"] for r in results)
+    assert lxapp._URL_INFLIGHT == {}
+    await probe_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_track_url_ttl_expiry_renews_via_probe(fake_lx, fresh_url_cache):
+    """TTL 到期先探活旧链续期（零额度消耗），不重新解析；续期后缓存刷新继续命中。"""
+    probe_client = mock_client(_flac_probe_handler)
+    item = {"id": "lx:kw:5886682", "lx_source": "kw"}
+    key = ("lx:kw:5886682", "lossless")
+    r1 = await lxapp._resolve_url_cached(probe_client, "kw", item, "lossless", 20.0)
+    assert len(fake_lx.url_calls) == 1
+    lxapp._URL_CACHE[key]["ts"] -= lxapp.CONF["url_cache_ttl"] + 1.0
+    r2 = await lxapp._resolve_url_cached(probe_client, "kw", item, "lossless", 20.0)
+    assert len(fake_lx.url_calls) == 1  # 旧链探活通过 → 续期，不消耗解析额度
+    assert r2["url"] == r1["url"]
+    r3 = await lxapp._resolve_url_cached(probe_client, "kw", item, "lossless", 20.0)
+    assert len(fake_lx.url_calls) == 1
+    assert r3["url"] == r1["url"]
+    await probe_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_track_url_ttl_expiry_dead_url_reresolves(fake_lx, fresh_url_cache):
+    """TTL 到期且旧链探活失败：重新解析并覆盖缓存。"""
+    probe_client = mock_client(_flac_probe_handler)
+    item = {"id": "lx:kw:5886682", "lx_source": "kw"}
+    key = ("lx:kw:5886682", "lossless")
+    r1 = await lxapp._resolve_url_cached(probe_client, "kw", item, "lossless", 20.0)
+    assert len(fake_lx.url_calls) == 1
+    entry = lxapp._URL_CACHE[key]
+    entry["data"] = {**entry["data"], "url": "https://media.test/dead.flac"}
+    entry["ts"] -= lxapp.CONF["url_cache_ttl"] + 1.0
+    r2 = await lxapp._resolve_url_cached(probe_client, "kw", item, "lossless", 20.0)
+    assert len(fake_lx.url_calls) == 2
+    assert r2["url"] == "https://media.test/song.flac"
+    await probe_client.aclose()
+
+
+def test_track_url_negative_cache_and_fresh_bypass(test_app_client, fresh_url_cache, fake_lx):
+    """解析失败写负缓存：短时间内重复请求不再打音源；fresh=1 旁路强制重新解析。
+
+    一次失败解析会走完整音质阶梯（flac→320k→128k 共 3 次调低档调用）。"""
+    fake_lx.url_result = None
+    r1 = test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless")
+    r2 = test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless")
+    assert r1.status_code == 404 and r2.status_code == 404
+    assert len(fake_lx.url_calls) == 3  # 第二次请求负缓存命中，未再走阶梯
+
+    r3 = test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless&fresh=1")
+    assert r3.status_code == 404
+    assert len(fake_lx.url_calls) == 6  # fresh 旁路负缓存，重新走一遍阶梯
+
+    # 音源恢复后 fresh 重取成功并覆盖负缓存，后续请求恢复命中
+    fake_lx.url_result = {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "test"}
+    orig_client = lxapp.app.state.client
+    lxapp.app.state.client = mock_client(_flac_probe_handler)
+    try:
+        r4 = test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless&fresh=1")
+        assert r4.status_code == 200
+        r5 = test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless")
+        assert r5.status_code == 200
+    finally:
+        lxapp.app.state.client = orig_client
+    assert len(fake_lx.url_calls) == 7  # 成功解析在首档即命中，仅 +1
+
+
+def test_track_url_quality_isolation(test_app_client, fresh_url_cache, fake_lx):
+    """不同音质档各自解析与缓存，同音质命中缓存（音质变化不串缓存）。"""
+    orig_client = lxapp.app.state.client
+    lxapp.app.state.client = mock_client(_flac_probe_handler)
+    try:
+        assert test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless").status_code == 200
+        assert test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless").status_code == 200
+        assert test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=high").status_code == 200
+        assert test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=high").status_code == 200
+    finally:
+        lxapp.app.state.client = orig_client
+    assert [q for _, q in fake_lx.url_calls] == ["flac", "320k"]
+
+
+def test_track_url_cache_cleared_on_source_change(test_app_client, fresh_url_cache, fake_lx):
+    """切换音源后直链缓存清空：后续请求重新解析，杜绝串源。"""
+    orig_client = lxapp.app.state.client
+    lxapp.app.state.client = mock_client(_flac_probe_handler)
+    try:
+        assert test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless").status_code == 200
+        assert len(fake_lx.url_calls) == 1
+        res = test_app_client.post("/api/v1/source", json={"url": "file:///data/lxserver/users/source/_open/source1"})
+        assert res.status_code == 200 and res.json()["ok"] is True
+        assert lxapp._URL_CACHE == {}
+        assert test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless").status_code == 200
+        assert len(fake_lx.url_calls) == 2
+    finally:
+        lxapp.app.state.client = orig_client
+
+
+@pytest.mark.asyncio
+async def test_url_inflight_leader_failure_cleans_up(monkeypatch, fresh_url_cache):
+    """领头解析异常传播给等待者，在途状态清理且不写缓存（含负缓存），随后可重试。"""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def flaky_resolve(client, src, item, quality="lossless", budget=20.0):
+        started.set()
+        await release.wait()
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(lxapp, "resolve_and_probe", flaky_resolve)
+    probe_client = mock_client(_flac_probe_handler)
+    item = {"id": "lx:kw:5886682", "lx_source": "kw"}
+    leader = asyncio.create_task(lxapp._resolve_url_cached(probe_client, "kw", item, "lossless", 20.0))
+    await started.wait()
+    follower = asyncio.create_task(lxapp._resolve_url_cached(probe_client, "kw", item, "lossless", 20.0))
+    await asyncio.sleep(0.05)
+    release.set()
+    with pytest.raises(RuntimeError, match="boom"):
+        await leader
+    with pytest.raises(RuntimeError, match="boom"):
+        await follower
+    assert lxapp._URL_INFLIGHT == {}
+    assert lxapp._URL_CACHE == {}
+
+    async def ok_resolve(client, src, item, quality="lossless", budget=20.0):
+        return {"id": item.get("id"), "url": "https://media.test/song.flac"}
+
+    monkeypatch.setattr(lxapp, "resolve_and_probe", ok_resolve)
+    r = await lxapp._resolve_url_cached(probe_client, "kw", item, "lossless", 20.0)
+    assert r["url"] == "https://media.test/song.flac"
+    await probe_client.aclose()
+
+
+
+
+@pytest.mark.asyncio
+async def test_url_inflight_cancelled_leader_does_not_cancel_follower(monkeypatch, fresh_url_cache):
+    started = asyncio.Event()
+    async def resolve(*args, **kwargs):
+        started.set()
+        await asyncio.Event().wait()
+    monkeypatch.setattr(lxapp, "resolve_and_probe", resolve)
+    item = {"id": "lx:kw:cancel", "lx_source": "kw"}
+    leader = asyncio.create_task(lxapp._resolve_url_cached(None, "kw", item, "lossless", 20))
+    await started.wait()
+    follower = asyncio.create_task(lxapp._resolve_url_cached(None, "kw", item, "lossless", 20))
+    await asyncio.sleep(0)
+    leader.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await leader
+    with pytest.raises(RuntimeError, match="leader cancelled"):
+        await follower
+    assert not follower.cancelled()
+    assert not lxapp._URL_INFLIGHT
+
+
+def test_source_deactivate_filename_differs_from_name(test_app_client, fake_lx, tmp_path, monkeypatch):
+    script = tmp_path / "local.js"
+    script.write_text("/**\n * @name Real Source\n */")
+    calls = []
+    async def enabled(source_id, value):
+        calls.append((source_id, value))
+        return source_id == "real-id"
+    async def find(**kwargs):
+        return {"id": "real-id"} if kwargs.get("by_name") == "Real Source" else None
+    monkeypatch.setattr(lxapp.LXSERVER, "set_source_enabled", enabled)
+    monkeypatch.setattr(lxapp, "_find_lxserver_source", find)
+    r = test_app_client.post("/api/v1/source", json={"url": script.as_uri(), "enabled": False})
+    assert r.status_code == 200, r.text
+    assert ("real-id", False) in calls
