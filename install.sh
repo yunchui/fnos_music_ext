@@ -81,6 +81,95 @@ log_info() { echo -e "\033[32m[INFO]\033[0m $*"; }
 log_warn() { echo -e "\033[33m[WARN]\033[0m $*"; }
 log_err() { echo -e "\033[31m[ERROR]\033[0m $*" >&2; }
 
+# 安装/升级事件留档：追加到 logs/install.log（运行日志保留 3 天，写失败绝不影响安装）
+APP_LOG_DIR="${BASE_DIR}/logs"
+configure_app_logs() {
+    # Only checkout/logs is managed. Descriptor-relative, no-follow operations
+    # avoid chmod/chown through symlinks (or hardlinks to unrelated files).
+    # Keep native paths unchanged; Docker's appuser shares numeric group 1000.
+    local python_cmd=(python3)
+    if [ "${EUID}" -ne 0 ] && sudo -n true 2>/dev/null; then
+        python_cmd=(sudo -n python3)
+    fi
+    "${python_cmd[@]}" - "$(cd "${BASE_DIR}" && pwd -P)" "$@" <<'PY'
+import datetime
+import os
+import stat
+import sys
+
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+base = os.open(sys.argv[1], flags)
+try:
+    try:
+        os.mkdir("logs", 0o700, dir_fd=base)
+    except FileExistsError:
+        pass
+    logs = os.open("logs", flags, dir_fd=base)
+    try:
+        device = os.fstat(logs).st_dev
+
+        def repair(fd):
+            try:
+                if os.geteuid() == 0:
+                    os.fchown(fd, 0, 1000)
+                else:
+                    os.fchown(fd, -1, 1000)
+            except (PermissionError, OSError):
+                pass
+            os.fchmod(fd, 0o2770)
+            for name in os.listdir(fd):
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if info.st_dev != device:
+                    continue
+                if stat.S_ISDIR(info.st_mode):
+                    child = os.open(name, flags, dir_fd=fd)
+                    try:
+                        if os.fstat(child).st_dev == device:
+                            repair(child)
+                    finally:
+                        os.close(child)
+                elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                    child = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+                    try:
+                        actual = os.fstat(child)
+                        if (stat.S_ISREG(actual.st_mode) and actual.st_nlink == 1
+                                and actual.st_dev == device):
+                            try:
+                                os.fchown(child, -1, 1000)
+                            except (PermissionError, OSError):
+                                pass
+                            os.fchmod(child, 0o640)
+                    finally:
+                        os.close(child)
+
+        repair(logs)
+        if len(sys.argv) > 2:
+            out = os.open("install.log", os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                          0o640, dir_fd=logs)
+            try:
+                info = os.fstat(out)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise ValueError("install.log must be an unlinked regular file")
+                try:
+                    os.fchown(out, -1, 1000)
+                except (PermissionError, OSError):
+                    pass
+                os.fchmod(out, 0o640)
+                stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                os.write(out, f"[{stamp}] [install] {sys.argv[2]}\n".encode("utf-8"))
+            finally:
+                os.close(out)
+    finally:
+        os.close(logs)
+finally:
+    os.close(base)
+PY
+}
+log_install() {
+    configure_app_logs "$*" 2>/dev/null || true
+}
+trap 'log_install "aborted line=${BASH_LINENO[0]:-?}"' ERR
+
 usage() {
     cat <<'EOF'
 用法: ./install.sh [选项]
@@ -697,6 +786,8 @@ else
 fi
 
 precheck_environment
+configure_app_logs || { log_err "无法安全配置私有共享日志目录: ${APP_LOG_DIR}"; exit 1; }
+log_install "begin version=${FNMUSIC_VERSION} args=$*"
 
 dotenv_escape() {
     printf "%s" "$1" | sed "s/'/'\\\\''/g"
@@ -933,7 +1024,9 @@ if [ "${ENABLE_LX}" -eq 1 ]; then
             *,*) _lx_rest="${_lx_rest#*,}" ;;
             *)   _lx_rest="" ;;
         esac
-        _lx_entry="$(printf '%s' "${_lx_entry}" | tr -d '[:space:]')"
+        # 仅去掉分隔项两端空白，保留文件名/目录名内部空格。
+        _lx_entry="${_lx_entry#"${_lx_entry%%[![:space:]]*}"}"
+        _lx_entry="${_lx_entry%"${_lx_entry##*[![:space:]]}"}"
         [ -z "${_lx_entry}" ] && continue
         case "${_lx_entry}" in
             http://*|https://*|file://*) ;;
@@ -1021,6 +1114,9 @@ if [ -d "${KEEP_DATA_DIR}" ] && [ ! -f "${BASE_DIR}/.env" ]; then
         log_warn "历史数据未完全成功恢复，将保留备份目录以防止数据丢失: ${KEEP_DATA_DIR}"
     fi
 fi
+
+# Reapply after retained-data restoration, before any service starts.
+configure_app_logs || { log_err "无法安全配置私有共享日志目录: ${APP_LOG_DIR}"; exit 1; }
 
 # v2.0.0 升级检测：旧 .env 三源并存（多 true）时强制重新三选一
 if [ -f "${BASE_DIR}/.env" ]; then
@@ -1174,9 +1270,11 @@ if [ -f "${ENV_PATH}" ]; then
     if [ -n "${PREV_VERSION}" ] && [ "${PREV_VERSION}" = "${FNMUSIC_VERSION}" ]; then
         log_warn "检测到同版本 (v${FNMUSIC_VERSION}) 重复安装：现有配置将被保护，"
         log_warn "仅补齐缺失配置项；密钥/自定义路径/ONLINE_SOURCES 等沿用已有值（备份: ${ENV_BACKUP}）。"
+        log_install "mode=reinstall version=${FNMUSIC_VERSION} backup=$(basename "${ENV_BACKUP}")"
     else
         log_info "检测到已有配置（v${PREV_VERSION:-未知} -> v${FNMUSIC_VERSION}）平滑升级："
         log_info "保留用户自定义配置与密钥，仅安全补齐新增/缺失配置项（备份: ${ENV_BACKUP}）。"
+        log_install "mode=upgrade from=${PREV_VERSION:-unknown} to=${FNMUSIC_VERSION} backup=$(basename "${ENV_BACKUP}")"
     fi
     MERGE_SUMMARY="$(python3 "${BASE_DIR}/proxy/env_merge.py" \
         --existing "${ENV_PATH}" --desired "${ENV_DESIRED}" \
@@ -1194,6 +1292,7 @@ else
         --existing /dev/null --desired "${ENV_DESIRED}" \
         --output "${ENV_PATH}" --explicit "${ENV_EXPLICIT}" --quiet
     log_info "已生成初始配置 ${ENV_PATH} (chmod 600)。API Key 不会出现在日志中。"
+    log_install "mode=fresh-install version=${FNMUSIC_VERSION}"
 fi
 
 # 存量迁移：历史安装会把当时的默认源写进 .env；env_merge 对该键保留旧值，
@@ -1218,38 +1317,72 @@ migrate_default_mirror FNMUSIC_APT_MIRROR "https://mirrors.aliyun.com" "https://
 # sources-data（docker=容器 /data），只改 URL 不动任何数据；目标文件不存在则不动
 # （外部 URL 与异常值一律保留原样）。
 migrate_lx_url_between_modes() {
-    local current target fs_target
-    current="$(sed -n "s/^LX_SOURCE_URL=//p" "${ENV_PATH}" 2>/dev/null | tail -1 | tr -d "\"'")"
-    [ -n "${current}" ] || return 0
-    if [ "${DEPLOY_MODE:-docker}" = "native" ]; then
-        case "${current}" in
-            file:///data/lxmusic/uploads/*)
-                fs_target="${BASE_DIR}/sources-data/lxmusic/uploads/${current#file:///data/lxmusic/uploads/}"
-                target="file://${fs_target}"
-                ;;
-            *) return 0 ;;
-        esac
-    else
-        case "${current}" in
-            file://${BASE_DIR}/sources-data/lxmusic/uploads/*)
-                fs_target="${BASE_DIR}/sources-data/lxmusic/uploads/${current#file://${BASE_DIR}/sources-data/lxmusic/uploads/}"
-                target="file:///data/lxmusic/uploads/${current#file://${BASE_DIR}/sources-data/lxmusic/uploads/}"
-                ;;
-            *) return 0 ;;
-        esac
-    fi
-    if [ ! -f "${fs_target#file://}" ]; then
-        return 0
-    fi
-    local desired
-    desired="$(mktemp)"
-    { echo "LX_SOURCE_URL='$(dotenv_escape "${target}")'"; } > "${desired}"
-    python3 "${BASE_DIR}/proxy/env_merge.py" --existing "${ENV_PATH}" \
-        --desired "${desired}" --output "${ENV_PATH}" \
-        --explicit "LX_SOURCE_URL" --quiet
-    rm -f "${desired}"
-    chmod 600 "${ENV_PATH}"
-    log_info "已将洛雪源 URL 迁移为当前部署形态路径（数据原样共用）"
+    python3 - "${BASE_DIR}" "${ENV_PATH}" "${DEPLOY_MODE:-docker}" <<'PY'
+import json
+import pathlib
+import sys
+import urllib.parse
+
+base, env_path, mode = sys.argv[1:]
+sys.path.insert(0, str(pathlib.Path(base) / "proxy"))
+from env_merge import parse_env_file, render_env, write_env_atomic
+
+pairs, others = parse_env_file(env_path)
+values = dict(pairs)
+data = pathlib.Path(base) / "sources-data"
+
+def rewrite(url):
+    if not isinstance(url, str) or not url.startswith("file://"):
+        return url
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return url
+    if parsed.netloc or parsed.query or parsed.fragment:
+        return url
+    path = urllib.parse.unquote(parsed.path)
+    # Only app-owned persistent script locations may be remapped. Accept a
+    # previous checkout's sources-data prefix for explicit cross-directory adopt.
+    relative = None
+    for marker in ("/data/", "/sources-data/"):
+        if marker in path:
+            tail = path.split(marker, 1)[1]
+            if tail.startswith(("lxmusic/uploads/", "lxserver/users/source/_open/")):
+                relative = pathlib.PurePosixPath(tail)
+                break
+    if relative is None or ".." in relative.parts:
+        return url
+    target = data / str(relative)
+    if not target.is_file():
+        return url
+    if mode == "native":
+        return target.as_uri()
+    return "file:///data/" + urllib.parse.quote(str(relative), safe="/")
+
+updates = {}
+if "LX_SOURCE_URL" in values:
+    target = rewrite(values["LX_SOURCE_URL"])
+    if target != values["LX_SOURCE_URL"]:
+        updates["LX_SOURCE_URL"] = target
+try:
+    items = json.loads(values.get("LX_SOURCE_LIST", ""))
+except (ValueError, TypeError):
+    items = None
+if isinstance(items, list):
+    changed = False
+    for item in items:
+        if isinstance(item, dict) and "url" in item:
+            target = rewrite(item["url"])
+            if target != item["url"]:
+                item["url"] = target
+                changed = True
+    if changed:
+        updates["LX_SOURCE_LIST"] = json.dumps(items, ensure_ascii=False, separators=(",", ":"))
+if updates:
+    merged = [(key, updates.get(key, value)) for key, value in pairs]
+    write_env_atomic(env_path, render_env(merged, trailing=others))
+    print("[INFO] 已将洛雪源 URL/列表迁移为当前部署形态路径（数据原样共用）")
+PY
 }
 migrate_lx_url_between_modes
 
@@ -1273,8 +1406,11 @@ install_unit() {
         return 1
     fi
     if [ -f "${dest}" ] && ! same_dir "$(unit_working_dir "${dest}")" "${BASE_DIR}"; then
-        log_err "目标 unit 不属于当前目录；拒绝覆盖。"
-        return 1
+        if [ "${ADOPT:-0}" -ne 1 ]; then
+            log_err "目标 unit 不属于当前目录；拒绝覆盖（迁移请追加 --adopt）。"
+            return 1
+        fi
+        log_warn "按 --adopt 将原生音源 unit 迁移到当前目录 ${BASE_DIR}。"
     fi
     sudo cp "${src}" "${dest}" || return 1
     rm -f "${src}"
@@ -1669,6 +1805,7 @@ done
 log_info "============================================================"
 log_info "🎉 fnmusic-ext v${FNMUSIC_VERSION} 安装配置完成！"
 log_info "已启用音源（${MODE_LABEL}）:${SELECTED}"
+log_install "done version=${FNMUSIC_VERSION} deploy=${DEPLOY_MODE} sources=${SELECTED} webui=${WEBUI_FLAG}"
 log_info "------------------------------------------------------------"
 log_info "【音源服务状态】（未启用的音源进程不驻留内存）"
 [ "${ENABLE_MUSICBOX}" -eq 1 ] && log_info "  • musicbox  [8770] 网易云音源     http://127.0.0.1:8770/healthz"

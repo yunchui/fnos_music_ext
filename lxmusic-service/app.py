@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -37,8 +38,14 @@ from lxserver_client import (
     parse_interval_to_seconds,
 )
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # 仓库根：复用 proxy/fnlog
+from proxy.fnlog import diag as fn_diag  # noqa: E402
+from proxy.fnlog import setup_logging  # noqa: E402
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("fnmusic.lxmusic")
+# 本地文件日志（logs/lxmusic.log，按天滚动保留 3 天）；失败静默降级为仅 stdout
+setup_logging("fnmusic.lxmusic", "lxmusic")
 
 SERVICE_VERSION = "2.7.0"
 UA_PC = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -72,7 +79,7 @@ _SONG_CACHE: dict[str, dict] = {}
 # 播放直链缓存: (canonical_id, tier) -> {"data": dict | None, "ts": float}；data=None 为失败负缓存
 _URL_CACHE: dict[tuple[str, str], dict] = {}
 # 同键在途解析合并：key -> Future（与 musicdl SingleFlight 同型的 shielded-future 去重）
-_URL_INFLIGHT: dict[tuple[str, str], asyncio.Future] = {}
+_URL_INFLIGHT: dict[tuple[int, str, str, bool], asyncio.Future] = {}
 # 源代计数：切源/重导入脚本时自增，代间在途解析的回写据此丢弃，防止串源
 _URL_CACHE_GEN = 0
 _STATS = {"searches": 0, "url_resolutions": 0, "url_cache_hits": 0, "errors": 0}
@@ -183,21 +190,17 @@ async def _resolve_url_cached(
             data = entry.get("data")
             if data is None:
                 if age <= CONF["url_cache_neg_ttl"]:
+                    fn_diag(logger, "url_cache", op="neg_hit", song=str(canonical_id)[:60],
+                            quality=str(tiers[0] if tiers else "standard"))
                     return None
             elif age <= CONF["url_cache_ttl"]:
                 _STATS["url_cache_hits"] += 1
+                fn_diag(logger, "url_cache", op="hit", song=str(canonical_id)[:60],
+                        quality=str(tiers[0] if tiers else "standard"))
                 return data
-            else:
-                refreshed = await _refresh_cached_url(client, data)
-                if refreshed is not None:
-                    if _URL_CACHE_GEN == gen:
-                        entry["data"] = refreshed
-                        entry["ts"] = time.monotonic()
-                    _STATS["url_cache_hits"] += 1
-                    return refreshed
 
     remaining = deadline - time.monotonic()
-    return await _resolve_url_inflight(client, src, item, quality, max(remaining, 1.0), key, gen)
+    return await _resolve_url_inflight(client, src, item, quality, max(remaining, 1.0), key, gen, fresh)
 
 
 async def _resolve_url_inflight(
@@ -208,16 +211,38 @@ async def _resolve_url_inflight(
     budget: float,
     key: tuple[str, str],
     gen: int,
+    fresh: bool = False,
 ) -> dict | None:
-    """实际解析执行段：同键在途合并，失败/取消正确清理在途状态供后续重试。"""
-    existing = _URL_INFLIGHT.get(key)
+    """探活及解析整体合并；不同源代和强制刷新不共享旧探活任务。"""
+    inflight_key = (gen, *key, fresh)
+    existing = _URL_INFLIGHT.get(inflight_key)
     if existing is not None:
+        # issue #45：同键并发跟随者共享领队的实际解析，不再重复消耗音源额度
+        fn_diag(logger, "url_inflight", op="join", song=str(key[0])[:60], quality=str(key[1]))
         return await asyncio.shield(existing)
 
     fut = asyncio.get_running_loop().create_future()
-    _URL_INFLIGHT[key] = fut
+    _URL_INFLIGHT[inflight_key] = fut
     try:
-        result = await resolve_and_probe(client, src, item, quality, budget=budget)
+        deadline = time.monotonic() + budget
+        result = None
+        refreshed_hit = False
+        if not fresh:
+            entry = _URL_CACHE.get(key)
+            if entry and entry.get("data") is not None:
+                remaining = deadline - time.monotonic()
+                try:
+                    async with asyncio.timeout(max(remaining, 0.001)):
+                        result = await _refresh_cached_url(client, entry["data"])
+                except TimeoutError:
+                    result = None
+                refreshed_hit = result is not None
+        if not refreshed_hit:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                result = await resolve_and_probe(client, src, item, quality, budget=remaining)
+        else:
+            _STATS["url_cache_hits"] += 1
     except BaseException as exc:
         if not fut.done():
             # 领队被取消时不能把 CancelledError 设给跟随者：跟随者的任务并未被
@@ -231,8 +256,12 @@ async def _resolve_url_inflight(
             fut.exception()
         raise
     finally:
-        _URL_INFLIGHT.pop(key, None)
+        if _URL_INFLIGHT.get(inflight_key) is fut:
+            _URL_INFLIGHT.pop(inflight_key, None)
 
+    # issue #45：留档每次真实上游解析（领队），与 hit/join 对比可核对额度消耗
+    fn_diag(logger, "url_resolve", op="ok" if result else "none",
+            song=str(key[0])[:60], quality=str(key[1]))
     if _URL_CACHE_GEN == gen:
         if len(_URL_CACHE) >= CONF["url_cache_max"]:
             # 容量超限清理最早的一半（与 _cache_put 同策略）
@@ -378,14 +407,20 @@ def _chain_available(name: str) -> bool:
     h = _CHAIN_HEALTH.get(name)
     if not h:
         return True
-    if h.get("half_open"):
-        return False
-    open_until = h.get("open_until", 0)
     now = time.time()
+    if h.get("half_open"):
+        # 半开试探在途：超过一个试探周期仍未回填（解析任务被取消等）自动放行
+        # 新试探，避免熔断器被一次未落地的试探永久卡死
+        if now - h.get("half_open_since", now) > _CHAIN_RETRY_SECONDS:
+            h["half_open"] = False
+        else:
+            return False
+    open_until = h.get("open_until", 0)
     if open_until and now < open_until:
         # half-open 试探
         if now >= h.get("next_try", 0):
             h["half_open"] = True
+            h["half_open_since"] = now
             return True
         return False
     return True
@@ -417,6 +452,7 @@ def chain_health_snapshot() -> dict[str, dict]:
         result[k] = {
             "fails": v.get("fails", 0),
             "state": "open" if open_until > now else "closed",
+            "half_open": bool(v.get("half_open")),
             "open_seconds_left": max(0, int(open_until - now)),
         }
     return result
@@ -545,6 +581,28 @@ _SEARCH_GATE = LxSearchGate()
 
 # ------------------------------------------------------------- 核心解析逻辑 --
 
+# 同档位探活失败后的换源上限：多源同时激活时逐个排除已产出坏链的脚本再试，
+# 超出按音源脚本数量上限直接降档（每轮仍受 resolver_timeout 与总预算约束）
+_MAX_SOURCE_ROUNDS = 3
+
+
+def _scripts_tried(res: dict) -> list[str]:
+    """解析结果里实际参与过的脚本标识（attempts 全部 + 最终产出者），供同档换源排除。
+
+    lxserver 的 excludeApiSources 按脚本 name 或 id（不区分大小写）过滤，二者都传。"""
+    names: list[str] = []
+    for a in (res.get("attempts") or []):
+        if isinstance(a, dict):
+            name = str(a.get("name") or "").strip()
+            if name:
+                names.append(name)
+    for key in ("sourceId", "sourceName"):
+        name = str(res.get(key) or "").strip()
+        if name:
+            names.append(name)
+    return list(dict.fromkeys(names))
+
+
 async def resolve_and_probe(
     client: httpx.AsyncClient,
     source: str,
@@ -552,12 +610,18 @@ async def resolve_and_probe(
     quality: str = "lossless",
     budget: float = 20.0,
 ) -> dict | None:
-    """尝试按音质阶梯从 lxserver 获取播放直链，并对结果执行 Range 媒体签名探活。"""
+    """尝试按音质阶梯从 lxserver 获取播放直链，并对结果执行 Range 媒体签名探活。
+
+    熔断按平台独立计数：某一平台（如 tx 只产出加密 mflac、mg 后端全挂）连续失败
+    只熔断该平台，不再拖垮其他健康平台的解析（2026-10-10 全局熔断误伤全平台故障）。
+    同档位直链探活失败或脚本静默空返回（200 无 url）时，按 excludeApiSources 排除
+    已试脚本换下一个激活源重试。"""
     src = normalize_source(source)
     track_id = item.get("id") or f"lx:{src}:{item.get('songmid', '')}"
+    chain_key = f"user_source:{src}" if src else "user_source"
 
-    if not _chain_available("user_source"):
-        logger.warning("lx resolve skipped: user_source circuit is open")
+    if not _chain_available(chain_key):
+        logger.warning("lx resolve skipped: %s circuit is open", chain_key)
         return None
 
     # 反查或合成 songInfo
@@ -575,52 +639,73 @@ async def resolve_and_probe(
             break
         lx_q = _tier_to_lx_quality(tier)
         attempted_tiers.append(tier)
-        try:
-            async with asyncio.timeout(min(remaining, float(CONF["resolver_timeout"]))):
-                res = await LXSERVER.get_music_url(song_info, lx_q)
-        except Exception as exc:
-            logger.debug("lxserver get_music_url tier %s failed: %s", tier, exc)
-            res = None
+        excluded: list[str] = []
+        for _round in range(_MAX_SOURCE_ROUNDS):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                async with asyncio.timeout(min(remaining, float(CONF["resolver_timeout"]))):
+                    res = await LXSERVER.get_music_url(song_info, lx_q,
+                                                       exclude_api_sources=excluded or None)
+            except Exception as exc:
+                logger.debug("lxserver get_music_url tier %s failed: %s", tier, exc)
+                res = None
 
-        if not res or not res.get("url"):
-            continue
+            if not res or not res.get("url"):
+                if res is None:
+                    break  # 服务端无可用源/调用出错（已试尽全部源）：降档
+                # 200 但空 url：脚本"成功"却拿不出直链（如平台未激活的静默空返回），
+                # 与探活失败同等换源轮换
+                tried = [n for n in _scripts_tried(res) if n not in excluded]
+                excluded.extend(tried)
+                if res.get("hasMoreSources") is False or not tried:
+                    break
+                continue
 
-        raw_url = res["url"]
-        headers = {}
-        # 酷狗或特殊源防盗链头
-        if src == "kg":
-            headers["Referer"] = "https://www.kugou.com/"
-        elif src == "tx":
-            headers["Referer"] = "https://y.qq.com/"
+            raw_url = res["url"]
+            headers = {}
+            # 酷狗或特殊源防盗链头
+            if src == "kg":
+                headers["Referer"] = "https://www.kugou.com/"
+            elif src == "tx":
+                headers["Referer"] = "https://y.qq.com/"
 
-        # 媒体魔数探活（共用同一总预算）
-        remaining_probe = deadline - time.monotonic()
-        if remaining_probe <= 0:
-            break
-        try:
-            async with asyncio.timeout(remaining_probe):
-                ok, final_url, ct, size = await probe_url(client, raw_url, headers)
-        except Exception:
-            ok = False
+            # 媒体魔数探活（共用同一总预算）
+            remaining_probe = deadline - time.monotonic()
+            if remaining_probe <= 0:
+                break
+            try:
+                async with asyncio.timeout(remaining_probe):
+                    ok, final_url, ct, size = await probe_url(client, raw_url, headers)
+            except Exception:
+                ok = False
 
-        if ok:
-            _chain_record_success("user_source")
-            ext = "flac" if "flac" in ct else ("mp3" if "mp3" in ct else "mp3")
-            return {
-                "id": track_id,
-                "url": final_url,
-                "ext": ext,
-                "file_size": size,
-                "actual_tier": tier,
-                "resolver": "lxserver",
-                "headers": headers,
-                "br": 320000 if tier == "high" else (960000 if tier == "lossless" else 128000),
-                "attempted_tiers": attempted_tiers,
-            }
-        else:
-            logger.debug("probe_url rejected stream for %s at tier %s: ct=%s", track_id, tier, ct)
+            if ok:
+                _chain_record_success(chain_key)
+                ext = "flac" if "flac" in ct else ("mp3" if "mp3" in ct else "mp3")
+                return {
+                    "id": track_id,
+                    "url": final_url,
+                    "ext": ext,
+                    "file_size": size,
+                    "actual_tier": tier,
+                    "resolver": "lxserver",
+                    "headers": headers,
+                    "br": 320000 if tier == "high" else (960000 if tier == "lossless" else 128000),
+                    "attempted_tiers": attempted_tiers,
+                }
 
-    _chain_record_failure("user_source")
+            # 直链探活失败（过期/加密/HTML 错误页）：排除产出该链的脚本同档换源重试；
+            # 服务端确认已无更多候选源时不再轮换，直接降档
+            logger.info("probe rejected %s tier=%s ct=%s source=%s url=%.120s", track_id, tier,
+                        ct or "", res.get("sourceName") or "", raw_url)
+            tried = [n for n in _scripts_tried(res) if n not in excluded]
+            excluded.extend(tried)
+            if res.get("hasMoreSources") is False or not tried:
+                break
+
+    _chain_record_failure(chain_key)
     return None
 
 
@@ -756,6 +841,92 @@ def _env_active_source_urls() -> list[str]:
     return urls
 
 
+def _persisted_source_targets() -> list[str] | None:
+    """最新 .env 为准；缺少可读的配置才回退进程环境，None 表示旧单源配置。"""
+    from proxy.env_merge import parse_env_file
+
+    configured_path = os.environ.get("LX_ENV_PATH")
+    paths = [Path(configured_path)] if configured_path else [
+        Path(os.environ.get("WEBUI_REPO_DIR", "/repo")) / ".env",
+        Path(__file__).resolve().parent.parent / ".env",
+    ]
+    values = dict(os.environ)
+    from_disk = False
+    for path in paths:
+        try:
+            with path.open("r", encoding="utf-8"):
+                pass
+            entries, _ = parse_env_file(path)
+            values = dict(entries)
+            from_disk = True
+            break
+        except OSError:
+            continue
+    try:
+        items = json.loads(values.get("LX_SOURCE_LIST") or "[]")
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(items, list):
+        return None
+    if not items and "LX_SOURCE_LIST" in values and not values.get("LX_SOURCE_URL"):
+        return []
+    if not any(isinstance(i, dict) and "active" in i for i in items):
+        if from_disk:
+            url = str(values.get("LX_SOURCE_URL") or "").strip()
+            return [_normalize_legacy_file_url(url)] if url else []
+        return None
+    urls = [str(i.get("url") or "").strip() for i in items
+            if isinstance(i, dict) and i.get("active") and i.get("url")]
+    # 兼容此前 .env 写入无激活列表但保留旧单源指针的情况。
+    if not urls and not from_disk and values.get("LX_SOURCE_URL"):
+        urls = [str(values["LX_SOURCE_URL"]).strip()]
+    return list(dict.fromkeys(_normalize_legacy_file_url(url) for url in urls if url))
+
+
+async def _reconcile_source_targets(urls: list[str]) -> None:
+    """按持久化目标逐项恢复，并关闭未在目标集合中的启用源。"""
+    target_ids: set[str] = set()
+    all_ok = True
+    for url in urls:
+        latest = _persisted_source_targets()
+        if latest is not None and latest != urls:
+            # 保存配置与启动恢复交错时，不再依据旧快照激活。
+            return
+        try:
+            res = await source_set(SourceBody(url=url))
+            if isinstance(res, JSONResponse):
+                res = json.loads(res.body)
+            if not res.get("ok"):
+                all_ok = False
+                logger.warning("自动激活洛雪源失败: %s (%s)", url, res.get("error") or "")
+            elif res.get("source_id"):
+                target_ids.add(str(res["source_id"]))
+                continue
+        except Exception as exc:
+            all_ok = False
+            logger.warning("自动激活洛雪源失败: %s: %s", url, exc)
+        if url.startswith(("http://", "https://")):
+            existing = await _find_lxserver_source(by_url=url)
+        else:
+            parsed = urllib.parse.urlparse(url)
+            source_id = urllib.parse.unquote(parsed.path).rsplit("/", 1)[-1]
+            existing = await _find_lxserver_source(by_id=source_id, by_name=source_id.removesuffix(".js"))
+            if not existing and os.path.isfile(urllib.parse.unquote(parsed.path)):
+                script = Path(urllib.parse.unquote(parsed.path)).read_text(encoding="utf-8", errors="replace")
+                existing = await _find_lxserver_source(by_name=_parse_script_head_meta(script).get("name") or "")
+        if existing:
+            target_ids.add(str(existing.get("id") or ""))
+    latest = _persisted_source_targets()
+    if not all_ok or (latest is not None and latest != urls):
+        return
+    for s in await LXSERVER.list_custom_sources():
+        sid = str(s.get("id") or "")
+        if sid and sid not in target_ids and (s.get("enabled") or s.get("enable")):
+            await LXSERVER.set_source_enabled(sid, False)
+            _url_cache_reset()
+    _CHAIN_HEALTH.clear()
+
+
 async def _bootstrap_migration():
     for _ in range(20):
         try:
@@ -780,6 +951,10 @@ async def _bootstrap_migration():
                     except Exception as e:
                         logger.warning("迁移脚本 %s 失败: %s", js_file.name, e)
 
+        targets = _persisted_source_targets()
+        if targets is not None:
+            await _reconcile_source_targets(targets)
+            return
         active = await describe_user_source()
         if not active.get("configured"):
             # 优先按 LX_SOURCE_LIST 的 active 标记恢复多源激活（lxserver 数据卷被清时自愈）
@@ -954,6 +1129,43 @@ async def search_tracks(
         _SEARCH_PROBE_ENABLED.reset(probe_token)
 
 
+# 免登录榜单目标：平台 -> (榜单名, bangid 内置回退值)。
+# bangid 优先按榜单名从 lxserver boards 接口动态解析（上游换榜 id 不再静默失效），
+# boards 不可用或未命中时回退内置值；解析结果缓存 10 分钟（上游 boards 本就 max-age=600）。
+_CHART_TARGETS: dict[str, tuple[str, str]] = {
+    "kg": ("TOP500", "8888"),
+    "kw": ("飙升榜", "93"),
+    "wy": ("新歌榜", "3779629"),
+}
+_CHART_ID_TTL_S = 600.0
+_CHART_ID_CACHE: dict[str, tuple[float, str]] = {}
+
+
+async def _resolve_chart_id(src: str) -> str:
+    target, default = _CHART_TARGETS[src]
+    now = time.monotonic()
+    hit = _CHART_ID_CACHE.get(src)
+    if hit and now - hit[0] < _CHART_ID_TTL_S:
+        return hit[1]
+    bid = default
+    try:
+        boards = await LXSERVER.get_leaderboard_boards(src)
+        for b in boards:
+            if not isinstance(b, dict):
+                continue
+            if target in str(b.get("name") or ""):
+                bid = str(b.get("bangid") or b.get("id") or default).strip()
+                if "__" in bid:
+                    bid = bid.split("__", 1)[1]
+                if not bid:
+                    bid = default
+                break
+    except Exception as e:
+        logger.debug("leaderboard boards resolve failed for %s: %s", src, e)
+    _CHART_ID_CACHE[src] = (now, bid)
+    return bid
+
+
 @app.get("/api/v1/recommend")
 async def recommend_charts(limit: int = Query(0), sources: str = Query("")):
     """免登录榜单推荐 (kg TOP500 / kw 飙升榜 / wy 新歌榜)。"""
@@ -967,15 +1179,8 @@ async def recommend_charts(limit: int = Query(0), sources: str = Query("")):
     items: list[dict] = []
     errors: dict[str, str] = {}
 
-    # 榜单映射
-    chart_ids = {
-        "kg": "8888",   # TOP500
-        "kw": "93",     # 飙升榜
-        "wy": "3779629",# 新歌榜
-    }
-
     for src in wanted:
-        bid = chart_ids.get(src, "")
+        bid = await _resolve_chart_id(src)
         try:
             sub = await LXSERVER.get_leaderboard_list(src, bid, page=1)
             for it in sub:
@@ -1336,10 +1541,10 @@ async def source_set(body: SourceBody):
             status_code=500,
         )
 
-    _CHAIN_HEALTH.pop("user_source", None)
+    _CHAIN_HEALTH.clear()
     _url_cache_reset()
     user_src = await describe_user_source()
-    return {"ok": True, "data": user_src}
+    return {"ok": True, "data": user_src, "source_id": source_id}
 
 
 @app.delete("/api/v1/source")
@@ -1355,6 +1560,6 @@ async def source_clear():
         logger.warning("source_clear error: %s", exc)
         return JSONResponse(content={"ok": False, "error": str(exc)}, status_code=500)
 
-    _CHAIN_HEALTH.pop("user_source", None)
+    _CHAIN_HEALTH.clear()
     _url_cache_reset()
     return {"ok": True, "data": None}
